@@ -2,6 +2,7 @@ mod control;
 mod error;
 mod fanotify;
 mod instance;
+mod range_map;
 mod remote;
 
 use std::path::PathBuf;
