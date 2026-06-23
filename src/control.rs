@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -23,8 +23,14 @@ struct Request {
 struct DaemonInfo {
     state: &'static str,
     instances: usize,
-    io_backend: &'static str,
+    io_backends: [&'static str; 2],
     remote_backend: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct EnsureRangeRequest {
+    offset: u64,
+    len: u64,
 }
 
 #[derive(Serialize)]
@@ -68,32 +74,53 @@ impl ControlPlane {
                 let body = serde_json::to_vec(&DaemonInfo {
                     state: "running",
                     instances: self.registry.len().await,
-                    io_backend: "fanotify",
+                    io_backends: ["fanotify", "external"],
                     remote_backend: "oci-registry",
                 })?;
                 Ok(Response::json(200, body))
             }
-            _ if request.method == "PUT" && request.path.starts_with("/api/v1/instances/") => {
-                let instance_id = request
-                    .path
-                    .trim_start_matches("/api/v1/instances/")
+            _ if request.method == "POST" => {
+                let instance_id = ensure_range_instance_id(&request.path)
+                    .ok_or_else(|| Error::NotFound("unknown endpoint".to_string()))?;
+                let range: EnsureRangeRequest = serde_json::from_slice(&request.body)?;
+                let instance = self
+                    .registry
+                    .get(instance_id)
+                    .await
+                    .ok_or_else(|| Error::NotFound("instance not found".to_string()))?;
+                instance.ensure_range(range.offset, range.len).await?;
+                Ok(Response::empty(204))
+            }
+            _ if request.method == "PUT" => {
+                let instance_id = instance_id(&request.path)
+                    .ok_or_else(|| Error::NotFound("unknown endpoint".to_string()))?
                     .to_string();
-                if instance_id.is_empty() {
-                    return Err(Error::BadRequest("instance id is required".to_string()));
-                }
                 let mut config: InstanceConfig = serde_json::from_slice(&request.body)?;
                 config.instance_id = instance_id.clone();
                 self.registry.register(instance_id, config).await?;
                 Ok(Response::empty(204))
             }
-            _ if request.method == "DELETE" && request.path.starts_with("/api/v1/instances/") => {
-                let instance_id = request.path.trim_start_matches("/api/v1/instances/");
+            _ if request.method == "DELETE" => {
+                let instance_id = instance_id(&request.path)
+                    .ok_or_else(|| Error::NotFound("unknown endpoint".to_string()))?;
                 self.registry.unregister(instance_id).await?;
                 Ok(Response::empty(204))
             }
             _ => Err(Error::NotFound("unknown endpoint".to_string())),
         }
     }
+}
+
+fn instance_id(path: &str) -> Option<&str> {
+    let instance_id = path.strip_prefix("/api/v1/instances/")?;
+    (!instance_id.is_empty() && !instance_id.contains('/')).then_some(instance_id)
+}
+
+fn ensure_range_instance_id(path: &str) -> Option<&str> {
+    let instance_id = path
+        .strip_prefix("/api/v1/instances/")?
+        .strip_suffix("/ranges/ensure")?;
+    (!instance_id.is_empty() && !instance_id.contains('/')).then_some(instance_id)
 }
 
 async fn read_request(stream: &mut UnixStream) -> Result<Request> {
@@ -236,7 +263,9 @@ async fn write_response(stream: &mut UnixStream, response: Result<Response>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::instance::InstanceRegistry;
+    use crate::instance::{FetchConfig, InstanceRegistry, TriggerMode};
+    use crate::remote::{BlobDescriptor, RemoteSource};
+    use tempfile::NamedTempFile;
 
     #[tokio::test]
     async fn daemon_info_returns_backend_state() {
@@ -253,8 +282,52 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(value["state"], "running");
         assert_eq!(value["instances"], 0);
-        assert_eq!(value["io_backend"], "fanotify");
+        assert_eq!(
+            value["io_backends"],
+            serde_json::json!(["fanotify", "external"])
+        );
         assert_eq!(value["remote_backend"], "oci-registry");
+    }
+
+    #[tokio::test]
+    async fn external_instance_can_ensure_a_zero_length_range() {
+        let file = NamedTempFile::new().unwrap();
+        file.as_file().set_len(128).unwrap();
+        let registry = InstanceRegistry::new(None);
+        registry
+            .register(
+                "external".to_string(),
+                InstanceConfig {
+                    instance_id: String::new(),
+                    target_path: file.path().to_path_buf(),
+                    blob: BlobDescriptor {
+                        digest: "sha256:abc".to_string(),
+                        size: 128,
+                        media_type: None,
+                    },
+                    source: RemoteSource::OciRegistry {
+                        image_ref: "registry.example.com/ns/image:tag".to_string(),
+                        hosts_dir: None,
+                    },
+                    auth: None,
+                    fetch: FetchConfig::default(),
+                    trigger_mode: TriggerMode::External,
+                },
+            )
+            .await
+            .unwrap();
+        let control = ControlPlane::new(registry);
+
+        let response = control
+            .handle_request(Request {
+                method: "POST".to_string(),
+                path: "/api/v1/instances/external/ranges/ensure".to_string(),
+                body: br#"{"offset":0,"len":0}"#.to_vec(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, 204);
     }
 
     #[test]
