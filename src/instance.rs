@@ -15,6 +15,14 @@ use crate::remote::{AuthConfig, BlobDescriptor, RemoteBackend, RemoteSource};
 
 pub const DEFAULT_FETCH_UNIT_BYTES: u64 = BITMAP_UNIT_BYTES;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerMode {
+    #[default]
+    Fanotify,
+    External,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceConfig {
     #[serde(skip)]
@@ -26,6 +34,8 @@ pub struct InstanceConfig {
     pub auth: Option<AuthConfig>,
     #[serde(default)]
     pub fetch: FetchConfig,
+    #[serde(default)]
+    pub trigger_mode: TriggerMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,8 +146,10 @@ impl InstanceRegistry {
         }
 
         let instance = Arc::new(Instance::open(config)?);
-        if let Some(fanotify) = &self.inner.fanotify {
-            fanotify.mark(instance_id.clone(), &instance.config.target_path)?;
+        if instance.config.trigger_mode == TriggerMode::Fanotify {
+            if let Some(fanotify) = &self.inner.fanotify {
+                fanotify.mark(instance_id.clone(), &instance.config.target_path)?;
+            }
         }
         instances.insert(instance_id, instance);
         Ok(())
@@ -146,7 +158,9 @@ impl InstanceRegistry {
     pub async fn unregister(&self, instance_id: &str) -> Result<()> {
         let removed = self.inner.instances.write().await.remove(instance_id);
         if let (Some(instance), Some(fanotify)) = (removed, &self.inner.fanotify) {
-            fanotify.unmark(&instance.config.target_path)?;
+            if instance.config.trigger_mode == TriggerMode::Fanotify {
+                fanotify.unmark(&instance.config.target_path)?;
+            }
         }
         Ok(())
     }
@@ -344,6 +358,7 @@ mod tests {
             },
             auth: None,
             fetch: FetchConfig::default(),
+            trigger_mode: TriggerMode::Fanotify,
         }
     }
 
