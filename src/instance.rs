@@ -9,8 +9,11 @@ use tokio::sync::RwLock;
 
 use crate::error::{Error, Result};
 use crate::fanotify::FanotifyBackend;
+use crate::range_map::{BITMAP_UNIT_BYTES, RangeMap, validate_fetch_unit_bytes};
 use crate::remote::oci::OciRemoteBackend;
 use crate::remote::{AuthConfig, BlobDescriptor, RemoteBackend, RemoteSource};
+
+pub const DEFAULT_FETCH_UNIT_BYTES: u64 = BITMAP_UNIT_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceConfig {
@@ -21,6 +24,22 @@ pub struct InstanceConfig {
     pub source: RemoteSource,
     #[serde(default)]
     pub auth: Option<AuthConfig>,
+    #[serde(default)]
+    pub fetch: FetchConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchConfig {
+    #[serde(default = "default_fetch_unit_bytes")]
+    pub unit_bytes: u64,
+}
+
+impl Default for FetchConfig {
+    fn default() -> Self {
+        Self {
+            unit_bytes: DEFAULT_FETCH_UNIT_BYTES,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -36,6 +55,8 @@ struct RegistryInner {
 pub struct Instance {
     config: InstanceConfig,
     target: std::fs::File,
+    range_map: RangeMap,
+    trusted: bool,
     remote: Arc<dyn RemoteBackend>,
     inflight: Mutex<Vec<Range>>,
 }
@@ -101,6 +122,7 @@ impl InstanceRegistry {
                 "blob size must be greater than zero".to_string(),
             ));
         }
+        validate_fetch_unit_bytes(config.fetch.unit_bytes)?;
 
         config.instance_id = instance_id.clone();
         let mut instances = self.inner.instances.write().await;
@@ -132,16 +154,26 @@ impl InstanceRegistry {
 
 impl Instance {
     fn open(config: InstanceConfig) -> Result<Self> {
+        validate_fetch_unit_bytes(config.fetch.unit_bytes)?;
         let target = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&config.target_path)?;
+        let opened = RangeMap::open_or_create(&config.target_path, &config.blob)?;
+        if opened.needs_recovery {
+            opened.range_map.recovery_reconcile(&target)?;
+        }
         let remote = Arc::new(OciRemoteBackend::from_config(
             &config.blob,
             &config.source,
             config.auth.clone(),
         )?) as Arc<dyn RemoteBackend>;
-        Ok(Self::with_remote(config, target, remote))
+        Ok(Self::with_remote_and_range_map(
+            config,
+            target,
+            opened.range_map,
+            remote,
+        ))
     }
 
     #[cfg(test)]
@@ -150,24 +182,32 @@ impl Instance {
         target: std::fs::File,
         remote: Arc<dyn RemoteBackend>,
     ) -> Self {
+        validate_fetch_unit_bytes(config.fetch.unit_bytes).unwrap();
         config.instance_id = "test".to_string();
-        Self::with_remote(config, target, remote)
+        let opened = RangeMap::open_or_create(&config.target_path, &config.blob).unwrap();
+        if opened.needs_recovery {
+            opened.range_map.recovery_reconcile(&target).unwrap();
+        }
+        Self::with_remote_and_range_map(config, target, opened.range_map, remote)
     }
 
-    fn with_remote(
+    fn with_remote_and_range_map(
         config: InstanceConfig,
         target: std::fs::File,
+        range_map: RangeMap,
         remote: Arc<dyn RemoteBackend>,
     ) -> Self {
         Self {
             config,
             target,
+            range_map,
+            trusted: true,
             remote,
             inflight: Mutex::new(Vec::new()),
         }
     }
 
-    pub async fn ensure_range(&self, offset: u64, len: u64) -> Result<()> {
+    pub async fn ensure_range(self: &Arc<Self>, offset: u64, len: u64) -> Result<()> {
         if len == 0 {
             return Ok(());
         }
@@ -177,24 +217,42 @@ impl Instance {
         if end > self.config.blob.size {
             return Err(Error::BadRequest("range exceeds blob size".to_string()));
         }
-        if self.range_is_present(offset, len)? {
+        if !self.trusted {
+            return Err(Error::Remote("instance is not trusted".to_string()));
+        }
+        if self.range_map.is_range_ready(offset, len) {
             return Ok(());
         }
-        let range = Range { offset, len };
+        let range = self.amplify_to_fetch_unit(offset, len)?;
         let _guard = self.reserve_inflight(range).await?;
-        if self.range_is_present(offset, len)? {
+        if self.range_map.is_range_ready(offset, len) {
             return Ok(());
         }
-        let bytes = self.remote.read_range(offset, len).await?;
-        if bytes.len() != len as usize {
+        let bytes = self.remote.read_range(range.offset, range.len).await?;
+        if bytes.len() != range.len as usize {
             return Err(Error::Remote(format!(
                 "remote returned {} bytes, expected {}",
                 bytes.len(),
-                len
+                range.len
             )));
         }
-        self.write_all_at(&bytes, offset)?;
+        self.write_all_at(&bytes, range.offset)?;
+        self.range_map.set_range_ready(range.offset, range.len)?;
         Ok(())
+    }
+
+    fn amplify_to_fetch_unit(&self, offset: u64, len: u64) -> Result<Range> {
+        let unit = self.config.fetch.unit_bytes;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| Error::BadRequest("range overflows u64".to_string()))?;
+        let fetch_offset = (offset / unit) * unit;
+        let fetch_end = end.div_ceil(unit) * unit;
+        let fetch_end = fetch_end.min(self.config.blob.size);
+        Ok(Range {
+            offset: fetch_offset,
+            len: fetch_end - fetch_offset,
+        })
     }
 
     async fn reserve_inflight(&self, range: Range) -> Result<InflightGuard<'_>> {
@@ -211,45 +269,6 @@ impl Instance {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-    }
-
-    fn range_is_present(&self, offset: u64, len: u64) -> Result<bool> {
-        let end = offset
-            .checked_add(len)
-            .ok_or_else(|| Error::BadRequest("range overflows u64".to_string()))?;
-        let data = unsafe {
-            libc::lseek(
-                self.target.as_raw_fd(),
-                offset as libc::off_t,
-                libc::SEEK_DATA,
-            )
-        };
-        if data < 0 {
-            let err = std::io::Error::last_os_error();
-            return match err.raw_os_error() {
-                Some(libc::ENXIO) => Ok(false),
-                Some(libc::EINVAL) => Ok(false),
-                _ => Err(err.into()),
-            };
-        }
-        if data as u64 > offset {
-            return Ok(false);
-        }
-        let hole = unsafe {
-            libc::lseek(
-                self.target.as_raw_fd(),
-                offset as libc::off_t,
-                libc::SEEK_HOLE,
-            )
-        };
-        if hole < 0 {
-            let err = std::io::Error::last_os_error();
-            return match err.raw_os_error() {
-                Some(libc::ENXIO) | Some(libc::EINVAL) => Ok(false),
-                _ => Err(err.into()),
-            };
-        }
-        Ok(hole as u64 >= end)
     }
 
     fn write_all_at(&self, bytes: &Bytes, mut offset: u64) -> Result<()> {
@@ -269,7 +288,9 @@ impl Instance {
     }
 }
 
-use std::os::fd::AsRawFd;
+fn default_fetch_unit_bytes() -> u64 {
+    DEFAULT_FETCH_UNIT_BYTES
+}
 
 #[cfg(test)]
 mod tests {
@@ -284,12 +305,14 @@ mod tests {
     struct MockRemote {
         reads: AtomicUsize,
         delay: Duration,
+        calls: Mutex<Vec<(u64, u64)>>,
     }
 
     #[async_trait]
     impl RemoteBackend for MockRemote {
         async fn read_range(&self, offset: u64, len: u64) -> Result<Bytes> {
             self.reads.fetch_add(1, Ordering::SeqCst);
+            self.calls.lock().unwrap().push((offset, len));
             if !self.delay.is_zero() {
                 tokio::time::sleep(self.delay).await;
             }
@@ -301,6 +324,7 @@ mod tests {
         Arc::new(MockRemote {
             reads: AtomicUsize::new(0),
             delay: Duration::ZERO,
+            calls: Mutex::new(Vec::new()),
         })
     }
 
@@ -318,6 +342,7 @@ mod tests {
                 hosts_dir: None,
             },
             auth: None,
+            fetch: FetchConfig::default(),
         }
     }
 
@@ -358,18 +383,92 @@ mod tests {
         let file = NamedTempFile::new().unwrap();
         file.as_file().set_len(128).unwrap();
         let remote = mock_remote();
-        let instance = Instance::with_mock_remote(
+        let instance = Arc::new(Instance::with_mock_remote(
             config(file.path().to_path_buf()),
             file.reopen().unwrap(),
             remote.clone(),
-        );
+        ));
 
         instance.ensure_range(8, 4).await.unwrap();
 
         let mut buf = [0; 4];
         file.as_file().read_at(&mut buf, 8).unwrap();
-        assert_eq!(buf, [8, 8, 8, 8]);
+        assert_eq!(buf, [0, 0, 0, 0]);
         assert_eq!(remote.reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_range_is_amplified_to_fetch_unit() {
+        let file = NamedTempFile::new().unwrap();
+        file.as_file().set_len(2 * 1024 * 1024).unwrap();
+        let remote = mock_remote();
+        let mut cfg = config(file.path().to_path_buf());
+        cfg.blob.size = 2 * 1024 * 1024;
+        let instance = Arc::new(Instance::with_mock_remote(
+            cfg,
+            file.reopen().unwrap(),
+            remote.clone(),
+        ));
+
+        instance.ensure_range(8 * 1024, 4 * 1024).await.unwrap();
+
+        assert_eq!(remote.calls.lock().unwrap().as_slice(), &[(0, 1024 * 1024)]);
+        assert!(instance.range_map.is_range_ready(8 * 1024, 4 * 1024));
+    }
+
+    #[tokio::test]
+    async fn fetch_unit_can_span_multiple_bitmap_slots() {
+        let file = NamedTempFile::new().unwrap();
+        file.as_file().set_len(4 * 1024 * 1024).unwrap();
+        let remote = mock_remote();
+        let mut cfg = config(file.path().to_path_buf());
+        cfg.blob.size = 4 * 1024 * 1024;
+        cfg.fetch.unit_bytes = 2 * 1024 * 1024;
+        let instance = Arc::new(Instance::with_mock_remote(
+            cfg,
+            file.reopen().unwrap(),
+            remote.clone(),
+        ));
+
+        instance.ensure_range(8 * 1024, 4 * 1024).await.unwrap();
+
+        assert_eq!(
+            remote.calls.lock().unwrap().as_slice(),
+            &[(0, 2 * 1024 * 1024)]
+        );
+        assert!(instance.range_map.is_range_ready(0, 1024 * 1024));
+        assert!(instance.range_map.is_range_ready(1024 * 1024, 1024 * 1024));
+        assert!(!instance.range_map.is_range_ready(2 * 1024 * 1024, 1));
+
+        instance
+            .ensure_range(1024 * 1024 + 8 * 1024, 4 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(remote.reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_unit_must_align_to_bitmap_unit() {
+        let file = NamedTempFile::new().unwrap();
+        file.as_file().set_len(2 * 1024 * 1024).unwrap();
+        let registry = InstanceRegistry::new(None);
+        let mut small_fetch = config(file.path().to_path_buf());
+        small_fetch.blob.size = 2 * 1024 * 1024;
+        small_fetch.fetch.unit_bytes = 512 * 1024;
+
+        assert!(matches!(
+            registry.register("one".to_string(), small_fetch).await,
+            Err(Error::BadRequest(_))
+        ));
+
+        let mut unaligned_fetch = config(file.path().to_path_buf());
+        unaligned_fetch.blob.size = 2 * 1024 * 1024;
+        unaligned_fetch.fetch.unit_bytes = 1024 * 1024 + 512 * 1024;
+
+        assert!(matches!(
+            registry.register("two".to_string(), unaligned_fetch).await,
+            Err(Error::BadRequest(_))
+        ));
     }
 
     #[tokio::test]
@@ -378,11 +477,12 @@ mod tests {
         file.as_file().set_len(128).unwrap();
         file.as_file().write_all_at(b"xxxx", 16).unwrap();
         let remote = mock_remote();
-        let instance = Instance::with_mock_remote(
+        let instance = Arc::new(Instance::with_mock_remote(
             config(file.path().to_path_buf()),
             file.reopen().unwrap(),
             remote.clone(),
-        );
+        ));
+        instance.range_map.set_range_ready(16, 4).unwrap();
 
         instance.ensure_range(16, 4).await.unwrap();
 
@@ -394,11 +494,11 @@ mod tests {
         let file = NamedTempFile::new().unwrap();
         file.as_file().set_len(128).unwrap();
         let remote = mock_remote();
-        let instance = Instance::with_mock_remote(
+        let instance = Arc::new(Instance::with_mock_remote(
             config(file.path().to_path_buf()),
             file.reopen().unwrap(),
             remote,
-        );
+        ));
 
         assert!(matches!(
             instance.ensure_range(120, 16).await,
@@ -413,6 +513,7 @@ mod tests {
         let remote = Arc::new(MockRemote {
             reads: AtomicUsize::new(0),
             delay: Duration::from_millis(25),
+            calls: Mutex::new(Vec::new()),
         });
         let instance = Arc::new(Instance::with_mock_remote(
             config(file.path().to_path_buf()),
