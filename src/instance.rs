@@ -173,7 +173,8 @@ impl Instance {
             .read(true)
             .write(true)
             .open(&config.target_path)?;
-        let opened = RangeMap::open_or_create(&config.target_path, &config.blob)?;
+        let opened =
+            RangeMap::open_or_create(&config.target_path, &config.blob, config.fetch.unit_bytes)?;
         if opened.needs_recovery {
             opened.range_map.recovery_reconcile(&target)?;
         }
@@ -198,7 +199,9 @@ impl Instance {
     ) -> Self {
         validate_fetch_unit_bytes(config.fetch.unit_bytes).unwrap();
         config.instance_id = "test".to_string();
-        let opened = RangeMap::open_or_create(&config.target_path, &config.blob).unwrap();
+        let opened =
+            RangeMap::open_or_create(&config.target_path, &config.blob, config.fetch.unit_bytes)
+                .unwrap();
         if opened.needs_recovery {
             opened.range_map.recovery_reconcile(&target).unwrap();
         }

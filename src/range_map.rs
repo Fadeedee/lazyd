@@ -39,8 +39,12 @@ pub struct OpenedRangeMap {
 }
 
 impl RangeMap {
-    pub fn open_or_create(target_path: &Path, blob: &BlobDescriptor) -> Result<OpenedRangeMap> {
-        let unit_bytes = BITMAP_UNIT_BYTES;
+    pub fn open_or_create(
+        target_path: &Path,
+        blob: &BlobDescriptor,
+        unit_bytes: u64,
+    ) -> Result<OpenedRangeMap> {
+        validate_fetch_unit_bytes(unit_bytes)?;
         let path = bitmap_path(target_path);
         let existed = path.exists();
         let slot_count = slot_count(blob.size, unit_bytes)?;
@@ -286,7 +290,9 @@ mod tests {
     #[test]
     fn range_map_sets_and_clears_slots() {
         let file = NamedTempFile::new().unwrap();
-        let opened = RangeMap::open_or_create(file.path(), &blob(3 * 1024 * 1024)).unwrap();
+        let opened =
+            RangeMap::open_or_create(file.path(), &blob(3 * 1024 * 1024), BITMAP_UNIT_BYTES)
+                .unwrap();
         let map = opened.range_map;
 
         assert!(!map.is_range_ready(8, 4096));
@@ -301,20 +307,67 @@ mod tests {
     #[test]
     fn header_mismatch_rebuilds_empty_map() {
         let file = NamedTempFile::new().unwrap();
-        let opened = RangeMap::open_or_create(file.path(), &blob(1024 * 1024)).unwrap();
+        let opened =
+            RangeMap::open_or_create(file.path(), &blob(1024 * 1024), BITMAP_UNIT_BYTES).unwrap();
         opened.range_map.set_range_ready(0, 1).unwrap();
         drop(opened.range_map);
 
-        let opened = RangeMap::open_or_create(file.path(), &blob(2 * 1024 * 1024)).unwrap();
+        let opened =
+            RangeMap::open_or_create(file.path(), &blob(2 * 1024 * 1024), BITMAP_UNIT_BYTES)
+                .unwrap();
         assert!(!opened.needs_recovery);
         assert!(!opened.range_map.is_range_ready(0, 1));
+    }
+
+    #[test]
+    fn header_records_configured_unit_bytes() {
+        let file = NamedTempFile::new().unwrap();
+        let unit_bytes = 2 * BITMAP_UNIT_BYTES;
+        let opened =
+            RangeMap::open_or_create(file.path(), &blob(4 * BITMAP_UNIT_BYTES), unit_bytes)
+                .unwrap();
+        drop(opened.range_map);
+
+        let mut bitmap = File::open(bitmap_path(file.path())).unwrap();
+        let header = read_header(&mut bitmap).unwrap();
+
+        assert_eq!(header.magic, MAGIC);
+        assert_eq!(header.version, VERSION);
+        assert_eq!(header.unit_bytes, unit_bytes);
+        assert_eq!(header.blob_digest, "sha256:abc");
+        assert_eq!(header.blob_size, 4 * BITMAP_UNIT_BYTES);
+        assert_eq!(header.slot_count, 2);
+    }
+
+    #[test]
+    fn unit_bytes_mismatch_rebuilds_empty_map() {
+        let file = NamedTempFile::new().unwrap();
+        let opened =
+            RangeMap::open_or_create(file.path(), &blob(4 * BITMAP_UNIT_BYTES), BITMAP_UNIT_BYTES)
+                .unwrap();
+        opened
+            .range_map
+            .set_range_ready(0, BITMAP_UNIT_BYTES)
+            .unwrap();
+        drop(opened.range_map);
+
+        let opened = RangeMap::open_or_create(
+            file.path(),
+            &blob(4 * BITMAP_UNIT_BYTES),
+            2 * BITMAP_UNIT_BYTES,
+        )
+        .unwrap();
+
+        assert!(!opened.needs_recovery);
+        assert!(!opened.range_map.is_range_ready(0, BITMAP_UNIT_BYTES));
     }
 
     #[test]
     fn recovery_clears_ready_slot_when_layer_is_sparse() {
         let file = NamedTempFile::new().unwrap();
         file.as_file().set_len(1024 * 1024).unwrap();
-        let opened = RangeMap::open_or_create(file.path(), &blob(1024 * 1024)).unwrap();
+        let opened =
+            RangeMap::open_or_create(file.path(), &blob(1024 * 1024), BITMAP_UNIT_BYTES).unwrap();
         opened.range_map.set_range_ready(0, 1).unwrap();
 
         opened.range_map.recovery_reconcile(file.as_file()).unwrap();
@@ -328,7 +381,8 @@ mod tests {
         file.as_file()
             .write_all_at(&vec![1; 1024 * 1024], 0)
             .unwrap();
-        let opened = RangeMap::open_or_create(file.path(), &blob(1024 * 1024)).unwrap();
+        let opened =
+            RangeMap::open_or_create(file.path(), &blob(1024 * 1024), BITMAP_UNIT_BYTES).unwrap();
         opened.range_map.set_range_ready(0, 1).unwrap();
 
         opened.range_map.recovery_reconcile(file.as_file()).unwrap();
