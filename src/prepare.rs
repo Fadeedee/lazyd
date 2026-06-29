@@ -64,6 +64,11 @@ pub struct PreparedLayer {
     pub instance_id: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct PrepareImageResponse {
+    pub layers: Vec<PreparedLayer>,
+}
+
 pub fn prepare_cache_layers(
     cache_root: &Path,
     request: &PrepareImageRequest,
