@@ -2,6 +2,7 @@ use std::fs::File;
 use std::mem::{MaybeUninit, size_of};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +67,32 @@ pub struct DataPlane {
 impl DataPlane {
     pub fn new(registry: InstanceRegistry) -> Self {
         Self { registry }
+    }
+
+    pub fn bind(socket: &Path) -> Result<SeqpacketListener> {
+        SeqpacketListener::bind(socket)
+    }
+
+    pub async fn serve_listener(&self, listener: SeqpacketListener) -> Result<()> {
+        let listener = Arc::new(listener);
+        loop {
+            let listener = listener.clone();
+            let stream = tokio::task::spawn_blocking(move || listener.accept())
+                .await
+                .map_err(|err| Error::Remote(err.to_string()))??;
+            let data = self.clone();
+            tokio::spawn(async move {
+                if let Err(err) = data.handle_stream(stream).await {
+                    tracing::warn!(%err, "data stream failed");
+                }
+            });
+        }
+    }
+
+    async fn handle_stream(&self, stream: SeqpacketStream) -> Result<()> {
+        loop {
+            self.handle_stream_once(&stream).await?;
+        }
     }
 
     pub async fn handle_stream_once(&self, stream: &SeqpacketStream) -> Result<()> {
