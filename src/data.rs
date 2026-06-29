@@ -592,4 +592,90 @@ mod tests {
         assert_eq!(response.1, *b"xxxx");
         assert!(response.2 >= 0);
     }
+
+    #[tokio::test]
+    async fn fetch_tail_page_only_reads_real_blob_bytes_and_leaves_zero_padding() {
+        use std::io::Read;
+        use tempfile::NamedTempFile;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use crate::instance::{FetchConfig, InstanceConfig, InstanceRegistry, TriggerMode};
+        use crate::remote::{BlobDescriptor, RemoteSource};
+
+        let page_size = host_page_size().unwrap() as usize;
+        let blob_size = page_size - 17;
+        let registry_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/ns/image/blobs/sha256:tail"))
+            .and(header("range", format!("bytes=0-{}", blob_size - 1)))
+            .respond_with(ResponseTemplate::new(206).set_body_bytes(vec![b'z'; blob_size]))
+            .mount(&registry_server)
+            .await;
+
+        let cache = NamedTempFile::new().unwrap();
+        cache.as_file().set_len(page_size as u64).unwrap();
+        let registry = InstanceRegistry::new(None);
+        registry
+            .register(
+                "tail".to_string(),
+                InstanceConfig {
+                    instance_id: String::new(),
+                    target_path: cache.path().to_path_buf(),
+                    blob: BlobDescriptor {
+                        digest: "sha256:tail".to_string(),
+                        size: blob_size as u64,
+                        media_type: Some("application/vnd.erofs.layer.v1".to_string()),
+                    },
+                    source: RemoteSource::OciRegistry {
+                        image_ref: format!("{}/ns/image:tag", registry_server.uri()),
+                        hosts_dir: None,
+                    },
+                    auth: None,
+                    fetch: FetchConfig {
+                        unit_bytes: 1024 * 1024,
+                    },
+                    trigger_mode: TriggerMode::External,
+                },
+            )
+            .await
+            .unwrap();
+
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("lazyd-data.sock");
+        let listener = SeqpacketListener::bind(&socket).unwrap();
+        let data = DataPlane::new(registry);
+        let server = tokio::spawn(async move {
+            let stream = tokio::task::spawn_blocking(move || listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            data.handle_stream_once(&stream).await.unwrap();
+        });
+
+        let page = tokio::task::spawn_blocking(move || {
+            let client = SeqpacketStream::connect(&socket).unwrap();
+            let request = serde_json::to_vec(&FetchRequest {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: "tail-1".to_string(),
+                op: FetchOp::Fetch,
+                instance_id: "tail".to_string(),
+                pos: 0,
+                len: page_size as u64,
+            })
+            .unwrap();
+            client.send_packet(&request).unwrap();
+            let (_packet, fd) = client.recv_packet_with_fd().unwrap();
+            let mut file = std::fs::File::from(fd.unwrap());
+            let mut page = vec![0; page_size];
+            file.read_exact(&mut page).unwrap();
+            page
+        })
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        assert!(page[..blob_size].iter().all(|byte| *byte == b'z'));
+        assert!(page[blob_size..].iter().all(|byte| *byte == 0));
+    }
 }
