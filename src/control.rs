@@ -6,6 +6,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::error::{Error, Result};
 use crate::instance::{InstanceConfig, InstanceRegistry};
+use crate::prepare::PrepareImageRequest;
 
 #[derive(Clone)]
 pub struct ControlPlane {
@@ -79,6 +80,13 @@ impl ControlPlane {
                 })?;
                 Ok(Response::json(200, body))
             }
+            ("POST", "/api/v1/images/prepare") => {
+                let prepare: PrepareImageRequest = serde_json::from_slice(&request.body)?;
+                validate_prepare_request(&prepare)?;
+                Err(Error::NotImplemented(
+                    "prepare-image is not implemented".to_string(),
+                ))
+            }
             _ if request.method == "POST" => {
                 let instance_id = ensure_range_instance_id(&request.path)
                     .ok_or_else(|| Error::NotFound("unknown endpoint".to_string()))?;
@@ -109,6 +117,24 @@ impl ControlPlane {
             _ => Err(Error::NotFound("unknown endpoint".to_string())),
         }
     }
+}
+
+fn validate_prepare_request(request: &PrepareImageRequest) -> Result<()> {
+    if request.image_ref.trim().is_empty() {
+        return Err(Error::BadRequest("image_ref is required".to_string()));
+    }
+    if request.fetch.unit_bytes == 0 {
+        return Err(Error::BadRequest(
+            "fetch.unit_bytes must be greater than zero".to_string(),
+        ));
+    }
+    if request.pmem.alignment_bytes == 0 {
+        return Err(Error::BadRequest(
+            "pmem.alignment_bytes must be greater than zero".to_string(),
+        ));
+    }
+    let _ = (&request.hosts_dir, &request.auth);
+    Ok(())
 }
 
 fn instance_id(path: &str) -> Option<&str> {
@@ -237,6 +263,7 @@ fn render_response(response: Result<Response>) -> Result<Vec<u8>> {
         400 => "Bad Request",
         404 => "Not Found",
         409 => "Conflict",
+        501 => "Not Implemented",
         _ => "Internal Server Error",
     };
     let mut head = format!(
@@ -328,6 +355,23 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status, 204);
+    }
+
+    #[tokio::test]
+    async fn prepare_image_route_is_reserved() {
+        let control = ControlPlane::new(InstanceRegistry::new(None));
+        let response = render_response(
+            control
+                .handle_request(Request {
+                    method: "POST".to_string(),
+                    path: "/api/v1/images/prepare".to_string(),
+                    body: br#"{"image_ref":"registry.example.com/ns/image:tag","fetch":{"unit_bytes":1048576},"pmem":{"alignment_bytes":2097152}}"#.to_vec(),
+                })
+                .await,
+        )
+        .unwrap();
+        let text = String::from_utf8(response).unwrap();
+        assert!(text.starts_with("HTTP/1.1 501 Not Implemented"));
     }
 
     #[test]

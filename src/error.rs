@@ -6,6 +6,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     BadRequest(String),
     Conflict(String),
+    NotImplemented(String),
     NotFound(String),
     Io(std::io::Error),
     Json(serde_json::Error),
@@ -20,6 +21,7 @@ impl Error {
             Self::BadRequest(_) => 400,
             Self::NotFound(_) => 404,
             Self::Conflict(_) => 409,
+            Self::NotImplemented(_) => 501,
             Self::Io(_) | Self::Json(_) | Self::Http(_) | Self::Remote(_) | Self::Fanotify(_) => {
                 500
             }
@@ -30,6 +32,7 @@ impl Error {
         match self {
             Self::BadRequest(msg)
             | Self::Conflict(msg)
+            | Self::NotImplemented(msg)
             | Self::NotFound(msg)
             | Self::Remote(msg)
             | Self::Fanotify(msg) => msg.clone(),
