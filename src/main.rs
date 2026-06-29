@@ -2,6 +2,7 @@ mod control;
 mod error;
 mod fanotify;
 mod instance;
+mod prepare;
 mod range_map;
 mod remote;
 
