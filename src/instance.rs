@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -7,6 +8,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use crate::data::FetchRange;
 use crate::error::{Error, Result};
 use crate::fanotify::FanotifyBackend;
 use crate::range_map::{BITMAP_UNIT_BYTES, RangeMap, validate_fetch_unit_bytes};
@@ -256,6 +258,50 @@ impl Instance {
         self.write_all_at(&bytes, range.offset)?;
         self.range_map.set_range_ready(range.offset, range.len)?;
         Ok(())
+    }
+
+    pub async fn prepare_fetch_range(
+        self: &Arc<Self>,
+        offset: u64,
+        len: u64,
+        page_size: u64,
+    ) -> Result<(FetchRange, File)> {
+        if page_size == 0 {
+            return Err(Error::BadRequest(
+                "page size must be greater than zero".to_string(),
+            ));
+        }
+        if len == 0 {
+            return Err(Error::BadRequest(
+                "fetch len must be greater than zero".to_string(),
+            ));
+        }
+        if offset % page_size != 0 || len % page_size != 0 {
+            return Err(Error::BadRequest(
+                "fetch off and len must be page-aligned".to_string(),
+            ));
+        }
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| Error::BadRequest("range overflows u64".to_string()))?;
+        let blob_size = self.config.blob.size;
+        let blob_page_end = blob_size.div_ceil(page_size) * page_size;
+        if offset >= blob_size || end > blob_page_end {
+            return Err(Error::BadRequest(
+                "fetch range exceeds lazy blob tail page".to_string(),
+            ));
+        }
+
+        let real_len = blob_size.min(end) - offset;
+        self.ensure_range(offset, real_len).await?;
+        Ok((
+            FetchRange {
+                off: offset,
+                len,
+                dev_off: offset,
+            },
+            self.target.try_clone()?,
+        ))
     }
 
     fn amplify_to_fetch_unit(&self, offset: u64, len: u64) -> Result<Range> {
