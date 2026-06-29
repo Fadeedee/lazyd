@@ -1,16 +1,24 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Mutex;
 
 use crate::error::{Error, Result};
-use crate::instance::{InstanceConfig, InstanceRegistry};
-use crate::prepare::PrepareImageRequest;
+use crate::instance::{FetchConfig, InstanceConfig, InstanceRegistry, TriggerMode};
+use crate::prepare::{PrepareImageRequest, PrepareImageResponse, prepare_cache_layers};
+use crate::remote::RemoteSource;
+use crate::remote::oci::resolve_image_metadata;
+
+const DEFAULT_IMAGE_CACHE_DIR: &str = "/var/lib/lazyd/images";
 
 #[derive(Clone)]
 pub struct ControlPlane {
     registry: InstanceRegistry,
+    image_cache_dir: PathBuf,
+    prepare_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug)]
@@ -41,7 +49,15 @@ struct ErrorBody {
 
 impl ControlPlane {
     pub fn new(registry: InstanceRegistry) -> Self {
-        Self { registry }
+        Self::with_image_cache_dir(registry, PathBuf::from(DEFAULT_IMAGE_CACHE_DIR))
+    }
+
+    pub fn with_image_cache_dir(registry: InstanceRegistry, image_cache_dir: PathBuf) -> Self {
+        Self {
+            registry,
+            image_cache_dir,
+            prepare_lock: Arc::new(Mutex::new(())),
+        }
     }
 
     pub async fn serve(&self, socket: PathBuf) -> Result<()> {
@@ -83,9 +99,9 @@ impl ControlPlane {
             ("POST", "/api/v1/images/prepare") => {
                 let prepare: PrepareImageRequest = serde_json::from_slice(&request.body)?;
                 validate_prepare_request(&prepare)?;
-                Err(Error::NotImplemented(
-                    "prepare-image is not implemented".to_string(),
-                ))
+                let layers = self.prepare_image(prepare).await?;
+                let body = serde_json::to_vec(&PrepareImageResponse { layers })?;
+                Ok(Response::json(200, body))
             }
             _ if request.method == "POST" => {
                 let instance_id = ensure_range_instance_id(&request.path)
@@ -116,6 +132,43 @@ impl ControlPlane {
             }
             _ => Err(Error::NotFound("unknown endpoint".to_string())),
         }
+    }
+
+    async fn prepare_image(
+        &self,
+        request: PrepareImageRequest,
+    ) -> Result<Vec<crate::prepare::PreparedLayer>> {
+        let metadata = resolve_image_metadata(
+            &request.image_ref,
+            request.hosts_dir.as_deref(),
+            request.auth.clone(),
+        )
+        .await?;
+
+        let _guard = self.prepare_lock.lock().await;
+        let prepared = prepare_cache_layers(&self.image_cache_dir, &request, &metadata.layers)?;
+        for (layer, prepared_layer) in metadata.layers.into_iter().zip(prepared.iter()) {
+            self.registry
+                .register(
+                    prepared_layer.instance_id.clone(),
+                    InstanceConfig {
+                        instance_id: String::new(),
+                        target_path: prepared_layer.sparse_path.clone(),
+                        blob: layer,
+                        source: RemoteSource::OciRegistry {
+                            image_ref: request.image_ref.clone(),
+                            hosts_dir: request.hosts_dir.clone(),
+                        },
+                        auth: request.auth.clone(),
+                        fetch: FetchConfig {
+                            unit_bytes: request.fetch.unit_bytes,
+                        },
+                        trigger_mode: TriggerMode::External,
+                    },
+                )
+                .await?;
+        }
+        Ok(prepared)
     }
 }
 
@@ -263,7 +316,6 @@ fn render_response(response: Result<Response>) -> Result<Vec<u8>> {
         400 => "Bad Request",
         404 => "Not Found",
         409 => "Conflict",
-        501 => "Not Implemented",
         _ => "Internal Server Error",
     };
     let mut head = format!(
@@ -290,9 +342,12 @@ async fn write_response(stream: &mut UnixStream, response: Result<Response>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::instance::{FetchConfig, InstanceRegistry, TriggerMode};
+    use crate::instance::InstanceRegistry;
+    use crate::prepare::EROFS_LAYER_MEDIA_TYPE;
     use crate::remote::{BlobDescriptor, RemoteSource};
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, tempdir};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
     async fn daemon_info_returns_backend_state() {
@@ -358,20 +413,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_image_route_is_reserved() {
-        let control = ControlPlane::new(InstanceRegistry::new(None));
-        let response = render_response(
-            control
-                .handle_request(Request {
-                    method: "POST".to_string(),
-                    path: "/api/v1/images/prepare".to_string(),
-                    body: br#"{"image_ref":"registry.example.com/ns/image:tag","fetch":{"unit_bytes":1048576},"pmem":{"alignment_bytes":2097152}}"#.to_vec(),
-                })
-                .await,
-        )
-        .unwrap();
-        let text = String::from_utf8(response).unwrap();
-        assert!(text.starts_with("HTTP/1.1 501 Not Implemented"));
+    async fn prepare_image_creates_cache_and_registers_instances() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/ns/image/manifests/tag"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": {
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": "sha256:config",
+                    "size": 16
+                },
+                "layers": [{
+                    "mediaType": EROFS_LAYER_MEDIA_TYPE,
+                    "digest": "sha256:layer",
+                    "size": 4097
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/ns/image/blobs/sha256:config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        let cache = tempdir().unwrap();
+        let registry = InstanceRegistry::new(None);
+        let control = ControlPlane::with_image_cache_dir(registry.clone(), cache.path().into());
+
+        let response = control
+            .handle_request(Request {
+                method: "POST".to_string(),
+                path: "/api/v1/images/prepare".to_string(),
+                body: format!(
+                    r#"{{"image_ref":"{}/ns/image:tag","fetch":{{"unit_bytes":1048576}},"pmem":{{"alignment_bytes":2097152}}}}"#,
+                    server.uri()
+                )
+                .into_bytes(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(registry.len().await, 1);
+        let value: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(value["layers"][0]["index"], 0);
+        assert_eq!(value["layers"][0]["blob_digest"], "sha256:layer");
+        assert_eq!(value["layers"][0]["blob_size"], 4097);
+        assert_eq!(value["layers"][0]["pmem_size"], 2 * 1024 * 1024);
+        assert_eq!(value["layers"][0]["instance_id"], "erofs-sha256-layer");
+        assert!(PathBuf::from(value["layers"][0]["sparse_path"].as_str().unwrap()).exists());
+        assert!(PathBuf::from(value["layers"][0]["bitmap_path"].as_str().unwrap()).exists());
     }
 
     #[test]
