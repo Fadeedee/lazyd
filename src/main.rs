@@ -13,6 +13,7 @@ use clap::Parser;
 use tracing::info;
 
 use crate::control::ControlPlane;
+use crate::data::DataPlane;
 use crate::error::Result;
 use crate::fanotify::FanotifyBackend;
 use crate::instance::InstanceRegistry;
@@ -22,6 +23,13 @@ use crate::instance::InstanceRegistry;
 struct Cli {
     #[arg(long, env = "LAZYD_SOCKET", default_value = "/run/lazyd/lazyd.sock")]
     socket: PathBuf,
+
+    #[arg(
+        long,
+        env = "LAZYD_DATA_SOCKET",
+        default_value = "/run/lazyd/lazyd-data.sock"
+    )]
+    data_socket: PathBuf,
 
     #[arg(long, env = "LAZYD_DISABLE_FANOTIFY")]
     disable_fanotify: bool,
@@ -52,7 +60,20 @@ async fn main() -> Result<()> {
         backend.spawn_event_loop(registry.clone());
     }
 
+    let data = DataPlane::new(registry.clone());
+    let data_listener = DataPlane::bind(&cli.data_socket)?;
+    let data_socket = cli.data_socket.clone();
+    tokio::spawn(async move {
+        if let Err(err) = data.serve_listener(data_listener).await {
+            tracing::error!(%err, socket = %data_socket.display(), "data plane stopped");
+        }
+    });
+
     let control = ControlPlane::new(registry);
-    info!(socket = %cli.socket.display(), "starting lazyd");
+    info!(
+        socket = %cli.socket.display(),
+        data_socket = %cli.data_socket.display(),
+        "starting lazyd"
+    );
     control.serve(cli.socket).await
 }
