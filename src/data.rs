@@ -1,5 +1,5 @@
 use std::mem::{MaybeUninit, size_of};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -141,25 +141,104 @@ impl SeqpacketStream {
         Ok(())
     }
 
-    pub fn recv_packet(&self) -> Result<Vec<u8>> {
-        let mut buf = vec![0; MAX_PACKET_BYTES];
-        let received = unsafe {
-            libc::recv(
-                self.fd.as_raw_fd(),
-                buf.as_mut_ptr() as *mut libc::c_void,
-                buf.len(),
-                0,
-            )
+    pub fn send_packet_with_fd(&self, bytes: &[u8], fd: RawFd) -> Result<()> {
+        if bytes.len() > MAX_PACKET_BYTES {
+            return Err(Error::BadRequest("data packet too large".to_string()));
+        }
+
+        let mut iov = libc::iovec {
+            iov_base: bytes.as_ptr() as *mut libc::c_void,
+            iov_len: bytes.len(),
         };
+        let mut control = vec![0u8; cmsg_space(size_of::<RawFd>())];
+        let mut msg = unsafe { MaybeUninit::<libc::msghdr>::zeroed().assume_init() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = control.len();
+
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            if cmsg.is_null() {
+                return Err(Error::Remote(
+                    "failed to build fd control message".to_string(),
+                ));
+            }
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as _) as _;
+            std::ptr::copy_nonoverlapping(
+                &fd as *const RawFd as *const u8,
+                libc::CMSG_DATA(cmsg),
+                size_of::<RawFd>(),
+            );
+            msg.msg_controllen = (*cmsg).cmsg_len;
+        }
+
+        let sent = unsafe { libc::sendmsg(self.fd.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) };
+        if sent < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if sent as usize != bytes.len() {
+            return Err(Error::Remote("short seqpacket send".to_string()));
+        }
+        Ok(())
+    }
+
+    pub fn recv_packet(&self) -> Result<Vec<u8>> {
+        let (packet, _fd) = self.recv_packet_with_fd()?;
+        Ok(packet)
+    }
+
+    pub fn recv_packet_with_fd(&self) -> Result<(Vec<u8>, Option<OwnedFd>)> {
+        let mut buf = vec![0; MAX_PACKET_BYTES];
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
+        };
+        let mut control = vec![0u8; cmsg_space(size_of::<RawFd>())];
+        let mut msg = unsafe { MaybeUninit::<libc::msghdr>::zeroed().assume_init() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = control.len();
+
+        let received = unsafe { libc::recvmsg(self.fd.as_raw_fd(), &mut msg, 0) };
         if received < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
+        if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+            return Err(Error::Remote("truncated fd control message".to_string()));
+        }
+        let fd = unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            if cmsg.is_null() {
+                None
+            } else if (*cmsg).cmsg_level == libc::SOL_SOCKET
+                && (*cmsg).cmsg_type == libc::SCM_RIGHTS
+                && (*cmsg).cmsg_len >= libc::CMSG_LEN(size_of::<RawFd>() as _) as _
+            {
+                let mut fd = -1;
+                std::ptr::copy_nonoverlapping(
+                    libc::CMSG_DATA(cmsg),
+                    &mut fd as *mut RawFd as *mut u8,
+                    size_of::<RawFd>(),
+                );
+                (fd >= 0).then(|| OwnedFd::from_raw_fd(fd))
+            } else {
+                None
+            }
+        };
         if received == 0 {
             return Err(Error::Remote("data peer closed".to_string()));
         }
         buf.truncate(received as usize);
-        Ok(buf)
+        Ok((buf, fd))
     }
+}
+
+fn cmsg_space(len: usize) -> usize {
+    unsafe { libc::CMSG_SPACE(len as _) as usize }
 }
 
 fn create_seqpacket_socket() -> Result<OwnedFd> {
@@ -286,6 +365,35 @@ mod tests {
         let client = SeqpacketStream::connect(&path).unwrap();
         client.send_packet(b"first").unwrap();
         client.send_packet(b"second").unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn seqpacket_can_pass_file_descriptor() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::os::fd::AsRawFd;
+        use tempfile::NamedTempFile;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lazyd-data.sock");
+        let listener = SeqpacketListener::bind(&path).unwrap();
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"fd-data").unwrap();
+        file.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
+        let fd = file.as_file().as_raw_fd();
+
+        let server = std::thread::spawn(move || {
+            let stream = listener.accept().unwrap();
+            stream.send_packet_with_fd(b"ready", fd).unwrap();
+        });
+
+        let client = SeqpacketStream::connect(&path).unwrap();
+        let (packet, fd) = client.recv_packet_with_fd().unwrap();
+        assert_eq!(packet, b"ready");
+        let mut received = std::fs::File::from(fd.unwrap());
+        let mut text = String::new();
+        received.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "fd-data");
         server.join().unwrap();
     }
 }
