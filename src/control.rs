@@ -467,6 +467,62 @@ mod tests {
         assert!(PathBuf::from(value["layers"][0]["bitmap_path"].as_str().unwrap()).exists());
     }
 
+    #[tokio::test]
+    async fn prepare_image_is_idempotent_for_same_layer() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/ns/image/manifests/tag"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": {
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": "sha256:config",
+                    "size": 16
+                },
+                "layers": [{
+                    "mediaType": EROFS_LAYER_MEDIA_TYPE,
+                    "digest": "sha256:layer",
+                    "size": 4097
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/ns/image/blobs/sha256:config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        let cache = tempdir().unwrap();
+        let registry = InstanceRegistry::new(None);
+        let control = ControlPlane::with_image_cache_dir(registry.clone(), cache.path().into());
+
+        let body = format!(
+            r#"{{"image_ref":"{}/ns/image:tag","fetch":{{"unit_bytes":1048576}},"pmem":{{"alignment_bytes":2097152}}}}"#,
+            server.uri()
+        )
+        .into_bytes();
+        let first = control
+            .handle_request(Request {
+                method: "POST".to_string(),
+                path: "/api/v1/images/prepare".to_string(),
+                body: body.clone(),
+            })
+            .await
+            .unwrap();
+        let second = control
+            .handle_request(Request {
+                method: "POST".to_string(),
+                path: "/api/v1/images/prepare".to_string(),
+                body,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(registry.len().await, 1);
+        assert_eq!(first.body, second.body);
+    }
+
     #[test]
     fn parses_content_length() {
         assert_eq!(
