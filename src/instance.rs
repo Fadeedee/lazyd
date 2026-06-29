@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -7,6 +8,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use crate::data::FetchRange;
 use crate::error::{Error, Result};
 use crate::fanotify::FanotifyBackend;
 use crate::range_map::{BITMAP_UNIT_BYTES, RangeMap, validate_fetch_unit_bytes};
@@ -259,6 +261,58 @@ impl Instance {
         Ok(())
     }
 
+    pub async fn prepare_fetch_range(
+        self: &Arc<Self>,
+        offset: u64,
+        len: u64,
+        page_size: u64,
+    ) -> Result<(FetchRange, File)> {
+        if page_size == 0 {
+            return Err(Error::BadRequest(
+                "page size must be greater than zero".to_string(),
+            ));
+        }
+        if len == 0 {
+            return Err(Error::BadRequest(
+                "fetch len must be greater than zero".to_string(),
+            ));
+        }
+        if offset % page_size != 0 || len % page_size != 0 {
+            return Err(Error::BadRequest(
+                "fetch off and len must be page-aligned".to_string(),
+            ));
+        }
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| Error::BadRequest("range overflows u64".to_string()))?;
+        let blob_size = self.config.blob.size;
+        let blob_page_end = round_up(blob_size, page_size)?;
+        if offset >= blob_size || end > blob_page_end {
+            return Err(Error::BadRequest(
+                "fetch range exceeds lazy blob tail page".to_string(),
+            ));
+        }
+
+        let real_len = blob_size.min(end) - offset;
+        self.ensure_range(offset, real_len).await?;
+        let ready = self.amplify_to_fetch_unit(offset, real_len)?;
+        let ready_end = round_up(
+            ready
+                .end()
+                .ok_or_else(|| Error::BadRequest("range overflows u64".to_string()))?,
+            page_size,
+        )?
+        .min(blob_page_end);
+        Ok((
+            FetchRange {
+                off: ready.offset,
+                len: ready_end - ready.offset,
+                dev_off: ready.offset,
+            },
+            self.target.try_clone()?,
+        ))
+    }
+
     fn amplify_to_fetch_unit(&self, offset: u64, len: u64) -> Result<Range> {
         let unit = self.config.fetch.unit_bytes;
         let end = offset
@@ -304,6 +358,13 @@ impl Instance {
         }
         Ok(())
     }
+}
+
+fn round_up(value: u64, alignment: u64) -> Result<u64> {
+    value
+        .checked_add(alignment - 1)
+        .map(|value| (value / alignment) * alignment)
+        .ok_or_else(|| Error::BadRequest("range alignment overflows u64".to_string()))
 }
 
 fn default_fetch_unit_bytes() -> u64 {
@@ -433,6 +494,35 @@ mod tests {
 
         assert_eq!(remote.calls.lock().unwrap().as_slice(), &[(0, 1024 * 1024)]);
         assert!(instance.range_map.is_range_ready(8 * 1024, 4 * 1024));
+    }
+
+    #[tokio::test]
+    async fn fetch_returns_complete_page_aligned_ready_unit() {
+        let file = NamedTempFile::new().unwrap();
+        file.as_file().set_len(2 * 1024 * 1024).unwrap();
+        let remote = mock_remote();
+        let mut cfg = config(file.path().to_path_buf());
+        cfg.blob.size = 2 * 1024 * 1024;
+        let instance = Arc::new(Instance::with_mock_remote(
+            cfg,
+            file.reopen().unwrap(),
+            remote.clone(),
+        ));
+
+        let (range, _fd) = instance
+            .prepare_fetch_range(8 * 1024, 4 * 1024, 4 * 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(remote.calls.lock().unwrap().as_slice(), &[(0, 1024 * 1024)]);
+        assert_eq!(
+            range,
+            FetchRange {
+                off: 0,
+                len: 1024 * 1024,
+                dev_off: 0,
+            }
+        );
     }
 
     #[tokio::test]

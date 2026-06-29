@@ -1,3 +1,4 @@
+use std::fs::File;
 use std::mem::{MaybeUninit, size_of};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
@@ -5,6 +6,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::instance::InstanceRegistry;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 const MAX_PACKET_BYTES: usize = 64 * 1024;
@@ -54,6 +56,102 @@ pub struct SeqpacketListener {
 
 pub struct SeqpacketStream {
     fd: OwnedFd,
+}
+
+#[derive(Clone)]
+pub struct DataPlane {
+    registry: InstanceRegistry,
+}
+
+impl DataPlane {
+    pub fn new(registry: InstanceRegistry) -> Self {
+        Self { registry }
+    }
+
+    pub async fn handle_stream_once(&self, stream: &SeqpacketStream) -> Result<()> {
+        let packet = stream.recv_packet()?;
+        let response = self.handle_packet(&packet).await;
+        match response {
+            Ok((response, fd)) => {
+                let bytes = serde_json::to_vec(&response)?;
+                stream.send_packet_with_fd(&bytes, fd.as_raw_fd())
+            }
+            Err(response) => {
+                let bytes = serde_json::to_vec(&response)?;
+                stream.send_packet(&bytes)
+            }
+        }
+    }
+
+    async fn handle_packet(
+        &self,
+        packet: &[u8],
+    ) -> std::result::Result<(DataResponse, File), DataResponse> {
+        let request = parse_fetch_request(packet)?;
+        let request_id = request.request_id.clone();
+        let result = self.handle_fetch(request).await;
+        result.map_err(|err| DataResponse::Error {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            code: err.status_code(),
+            msg: err.message(),
+        })
+    }
+
+    async fn handle_fetch(&self, request: FetchRequest) -> Result<(DataResponse, File)> {
+        let page_size = host_page_size()?;
+        let instance = self
+            .registry
+            .get(&request.instance_id)
+            .await
+            .ok_or_else(|| Error::NotFound("instance not found".to_string()))?;
+        let (range, fd) = instance
+            .prepare_fetch_range(request.pos, request.len, page_size)
+            .await?;
+        Ok((
+            DataResponse::FetchOk {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: request.request_id,
+                ranges: vec![range],
+            },
+            fd,
+        ))
+    }
+}
+
+fn parse_fetch_request(packet: &[u8]) -> std::result::Result<FetchRequest, DataResponse> {
+    let request: FetchRequest =
+        serde_json::from_slice(packet).map_err(|err| DataResponse::Error {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: String::new(),
+            code: 400,
+            msg: err.to_string(),
+        })?;
+    if request.protocol_version != PROTOCOL_VERSION {
+        return Err(DataResponse::Error {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: request.request_id,
+            code: 400,
+            msg: "unsupported protocol_version".to_string(),
+        });
+    }
+    if request.request_id.is_empty() {
+        return Err(DataResponse::Error {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: request.request_id,
+            code: 400,
+            msg: "request_id is required".to_string(),
+        });
+    }
+    Ok(request)
+}
+
+fn host_page_size() -> Result<u64> {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(page_size as u64)
 }
 
 impl SeqpacketListener {
@@ -395,5 +493,103 @@ mod tests {
         received.read_to_string(&mut text).unwrap();
         assert_eq!(text, "fd-data");
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_request_returns_cache_fd() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use tempfile::NamedTempFile;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use crate::instance::{FetchConfig, InstanceConfig, InstanceRegistry, TriggerMode};
+        use crate::remote::{BlobDescriptor, RemoteSource};
+
+        let registry_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/ns/image/blobs/sha256:layer"))
+            .and(header("range", "bytes=0-4095"))
+            .respond_with(ResponseTemplate::new(206).set_body_bytes(vec![b'x'; 4096]))
+            .mount(&registry_server)
+            .await;
+
+        let cache = NamedTempFile::new().unwrap();
+        cache.as_file().set_len(4096).unwrap();
+        let registry = InstanceRegistry::new(None);
+        registry
+            .register(
+                "inst".to_string(),
+                InstanceConfig {
+                    instance_id: String::new(),
+                    target_path: cache.path().to_path_buf(),
+                    blob: BlobDescriptor {
+                        digest: "sha256:layer".to_string(),
+                        size: 4096,
+                        media_type: Some("application/vnd.erofs.layer.v1".to_string()),
+                    },
+                    source: RemoteSource::OciRegistry {
+                        image_ref: format!("{}/ns/image:tag", registry_server.uri()),
+                        hosts_dir: None,
+                    },
+                    auth: None,
+                    fetch: FetchConfig {
+                        unit_bytes: 1024 * 1024,
+                    },
+                    trigger_mode: TriggerMode::External,
+                },
+            )
+            .await
+            .unwrap();
+
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("lazyd-data.sock");
+        let listener = SeqpacketListener::bind(&socket).unwrap();
+        let data = DataPlane::new(registry);
+        let server = tokio::spawn(async move {
+            let stream = tokio::task::spawn_blocking(move || listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            data.handle_stream_once(&stream).await.unwrap();
+        });
+
+        let response = tokio::task::spawn_blocking(move || {
+            let client = SeqpacketStream::connect(&socket).unwrap();
+            let request = serde_json::to_vec(&FetchRequest {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: "req-1".to_string(),
+                op: FetchOp::Fetch,
+                instance_id: "inst".to_string(),
+                pos: 0,
+                len: 4096,
+            })
+            .unwrap();
+            client.send_packet(&request).unwrap();
+            let (packet, fd) = client.recv_packet_with_fd().unwrap();
+            let mut file = std::fs::File::from(fd.unwrap());
+            let mut data = [0; 4];
+            file.read_exact(&mut data).unwrap();
+            (packet, data, file.as_raw_fd())
+        })
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        let response_body: DataResponse = serde_json::from_slice(&response.0).unwrap();
+        assert_eq!(
+            response_body,
+            DataResponse::FetchOk {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: "req-1".to_string(),
+                ranges: vec![FetchRange {
+                    off: 0,
+                    len: 4096,
+                    dev_off: 0,
+                }],
+            }
+        );
+        assert_eq!(response.1, *b"xxxx");
+        assert!(response.2 >= 0);
     }
 }
