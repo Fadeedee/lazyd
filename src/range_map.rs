@@ -457,6 +457,36 @@ mod tests {
     }
 
     #[test]
+    fn version_mismatch_rebuilds_empty_map() {
+        let file = NamedTempFile::new().unwrap();
+        let path = bitmap_path(file.path());
+        let header = Header {
+            magic: MAGIC.to_string(),
+            version: VERSION + 1,
+            unit_bytes: BITMAP_UNIT_BYTES,
+            blob_digest: "sha256:abc".to_string(),
+            blob_size: BITMAP_UNIT_BYTES,
+            slot_count: 1,
+        };
+        let mut bitmap = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        initialize_file(&mut bitmap, &header).unwrap();
+        bitmap.write_all_at(&[1], HEADER_SIZE as u64).unwrap();
+        drop(bitmap);
+
+        let opened =
+            RangeMap::open_or_create(file.path(), &blob(BITMAP_UNIT_BYTES), BITMAP_UNIT_BYTES)
+                .unwrap();
+
+        assert!(!opened.needs_recovery);
+        assert!(!opened.range_map.is_range_ready(0, 1));
+    }
+
+    #[test]
     fn recovery_clears_ready_slot_when_layer_is_sparse() {
         let file = NamedTempFile::new().unwrap();
         file.as_file().set_len(1024 * 1024).unwrap();
