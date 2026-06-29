@@ -1,4 +1,5 @@
 mod control;
+mod data;
 mod error;
 mod fanotify;
 mod instance;
