@@ -19,9 +19,29 @@ pub struct PrepareImageRequest {
     #[serde(default)]
     pub auth: Option<AuthConfig>,
     #[serde(default)]
+    pub layers: Vec<PrepareLayerDescriptor>,
+    #[serde(default)]
     pub fetch: PrepareFetchConfig,
     #[serde(default)]
     pub pmem: PreparePmemConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PrepareLayerDescriptor {
+    pub index: u32,
+    pub digest: String,
+    pub size: u64,
+    pub media_type: String,
+}
+
+impl PrepareLayerDescriptor {
+    pub fn blob(&self) -> BlobDescriptor {
+        BlobDescriptor {
+            digest: self.digest.clone(),
+            size: self.size,
+            media_type: Some(self.media_type.clone()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -72,24 +92,21 @@ pub struct PrepareImageResponse {
 pub fn prepare_cache_layers(
     cache_root: &Path,
     request: &PrepareImageRequest,
-    layers: &[BlobDescriptor],
+    layers: &[PrepareLayerDescriptor],
 ) -> Result<Vec<PreparedLayer>> {
     validate_fetch_unit_bytes(request.fetch.unit_bytes)?;
     let mut prepared = Vec::with_capacity(layers.len());
-    for (index, layer) in layers.iter().enumerate() {
-        let media_type = layer.media_type.as_deref().ok_or_else(|| {
-            Error::BadRequest(format!(
-                "layer {index} has no media type; convert rootfs to native EROFS and push first"
-            ))
-        })?;
-        if media_type != EROFS_LAYER_MEDIA_TYPE {
+    for layer in layers {
+        if layer.media_type != EROFS_LAYER_MEDIA_TYPE {
             return Err(Error::BadRequest(format!(
-                "layer {index} media type {media_type} is not native EROFS; convert rootfs to native EROFS and push first"
+                "layer {} media type {} is not native EROFS; convert rootfs to native EROFS and push first",
+                layer.index, layer.media_type
             )));
         }
         if layer.size == 0 {
             return Err(Error::BadRequest(format!(
-                "layer {index} blob size must be greater than zero"
+                "layer {} blob size must be greater than zero",
+                layer.index
             )));
         }
 
@@ -103,19 +120,20 @@ pub fn prepare_cache_layers(
             .read(true)
             .write(true)
             .open(&sparse_path)?;
-        let opened = RangeMap::open_or_create(&sparse_path, layer, request.fetch.unit_bytes)?;
+        let blob = layer.blob();
+        let opened = RangeMap::open_or_create(&sparse_path, &blob, request.fetch.unit_bytes)?;
         if opened.needs_recovery {
             opened.range_map.recovery_reconcile(&target)?;
         }
 
         prepared.push(PreparedLayer {
-            index: index as u32,
+            index: layer.index,
             sparse_path: sparse_path.clone(),
             bitmap_path: bitmap_path(&sparse_path),
             blob_digest: layer.digest.clone(),
             blob_size: layer.size,
             pmem_size,
-            media_type: media_type.to_string(),
+            media_type: layer.media_type.clone(),
             instance_id: instance_id(&cache_key),
         });
     }
@@ -189,6 +207,7 @@ mod tests {
             image_ref: "registry.example.com/ns/image:tag".to_string(),
             hosts_dir: None,
             auth: None,
+            layers: Vec::new(),
             fetch: PrepareFetchConfig { unit_bytes },
             pmem: PreparePmemConfig { alignment_bytes },
         }
@@ -200,15 +219,17 @@ mod tests {
         let prepared = prepare_cache_layers(
             dir.path(),
             &request(1024 * 1024, 2 * 1024 * 1024),
-            &[BlobDescriptor {
+            &[PrepareLayerDescriptor {
+                index: 7,
                 digest: "sha256:layer".to_string(),
                 size: 3 * 1024 * 1024 + 1,
-                media_type: Some(EROFS_LAYER_MEDIA_TYPE.to_string()),
+                media_type: EROFS_LAYER_MEDIA_TYPE.to_string(),
             }],
         )
         .unwrap();
 
         assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].index, 7);
         assert_eq!(prepared[0].pmem_size, 4 * 1024 * 1024);
         assert_eq!(prepared[0].instance_id, "erofs-sha256-layer");
         assert_eq!(
@@ -224,10 +245,11 @@ mod tests {
         let err = prepare_cache_layers(
             dir.path(),
             &request(1024 * 1024, 2 * 1024 * 1024),
-            &[BlobDescriptor {
+            &[PrepareLayerDescriptor {
+                index: 0,
                 digest: "sha256:layer".to_string(),
                 size: 4096,
-                media_type: Some("application/vnd.oci.image.layer.v1.tar".to_string()),
+                media_type: "application/vnd.oci.image.layer.v1.tar".to_string(),
             }],
         )
         .unwrap_err();
