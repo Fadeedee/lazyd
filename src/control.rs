@@ -10,9 +10,8 @@ use crate::error::{Error, Result};
 use crate::instance::{FetchConfig, InstanceConfig, InstanceRegistry, TriggerMode};
 use crate::prepare::{PrepareImageRequest, PrepareImageResponse, prepare_cache_layers};
 use crate::remote::RemoteSource;
-use crate::remote::oci::resolve_image_metadata;
 
-const DEFAULT_IMAGE_CACHE_DIR: &str = "/var/lib/lazyd/images";
+pub(crate) const DEFAULT_IMAGE_CACHE_DIR: &str = "/var/lib/lazyd/images";
 
 #[derive(Clone)]
 pub struct ControlPlane {
@@ -138,23 +137,16 @@ impl ControlPlane {
         &self,
         request: PrepareImageRequest,
     ) -> Result<Vec<crate::prepare::PreparedLayer>> {
-        let metadata = resolve_image_metadata(
-            &request.image_ref,
-            request.hosts_dir.as_deref(),
-            request.auth.clone(),
-        )
-        .await?;
-
         let _guard = self.prepare_lock.lock().await;
-        let prepared = prepare_cache_layers(&self.image_cache_dir, &request, &metadata.layers)?;
-        for (layer, prepared_layer) in metadata.layers.into_iter().zip(prepared.iter()) {
+        let prepared = prepare_cache_layers(&self.image_cache_dir, &request, &request.layers)?;
+        for (layer, prepared_layer) in request.layers.iter().zip(prepared.iter()) {
             self.registry
-                .register(
+                .register_persistent(
                     prepared_layer.instance_id.clone(),
                     InstanceConfig {
                         instance_id: String::new(),
                         target_path: prepared_layer.sparse_path.clone(),
-                        blob: layer,
+                        blob: layer.blob(),
                         source: RemoteSource::OciRegistry {
                             image_ref: request.image_ref.clone(),
                             hosts_dir: request.hosts_dir.clone(),
@@ -175,6 +167,9 @@ impl ControlPlane {
 fn validate_prepare_request(request: &PrepareImageRequest) -> Result<()> {
     if request.image_ref.trim().is_empty() {
         return Err(Error::BadRequest("image_ref is required".to_string()));
+    }
+    if request.layers.is_empty() {
+        return Err(Error::BadRequest("layers is required".to_string()));
     }
     if request.fetch.unit_bytes == 0 {
         return Err(Error::BadRequest(
@@ -276,6 +271,7 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
         .map(|pos| pos + 4)
 }
 
+#[derive(Debug)]
 struct Response {
     status: u16,
     content_type: Option<&'static str>,
@@ -342,12 +338,16 @@ async fn write_response(stream: &mut UnixStream, response: Result<Response>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_DIGEST: &str =
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    const TEST_INSTANCE_ID: &str =
+        "erofs-sha256-1111111111111111111111111111111111111111111111111111111111111111";
     use crate::instance::InstanceRegistry;
     use crate::prepare::EROFS_LAYER_MEDIA_TYPE;
     use crate::remote::{BlobDescriptor, RemoteSource};
     use tempfile::{NamedTempFile, tempdir};
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::MockServer;
 
     #[tokio::test]
     async fn daemon_info_returns_backend_state() {
@@ -415,29 +415,6 @@ mod tests {
     #[tokio::test]
     async fn prepare_image_creates_cache_and_registers_instances() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v2/ns/image/manifests/tag"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "schemaVersion": 2,
-                "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                "config": {
-                    "mediaType": "application/vnd.oci.image.config.v1+json",
-                    "digest": "sha256:config",
-                    "size": 16
-                },
-                "layers": [{
-                    "mediaType": EROFS_LAYER_MEDIA_TYPE,
-                    "digest": "sha256:layer",
-                    "size": 4097
-                }]
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/v2/ns/image/blobs/sha256:config"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-            .mount(&server)
-            .await;
         let cache = tempdir().unwrap();
         let registry = InstanceRegistry::new(None);
         let control = ControlPlane::with_image_cache_dir(registry.clone(), cache.path().into());
@@ -447,8 +424,10 @@ mod tests {
                 method: "POST".to_string(),
                 path: "/api/v1/images/prepare".to_string(),
                 body: format!(
-                    r#"{{"image_ref":"{}/ns/image:tag","fetch":{{"unit_bytes":1048576}},"pmem":{{"alignment_bytes":2097152}}}}"#,
-                    server.uri()
+                    r#"{{"image_ref":"{}/ns/image:tag","layers":[{{"index":0,"digest":"{}","size":4097,"media_type":"{}"}}],"fetch":{{"unit_bytes":1048576}},"pmem":{{"alignment_bytes":2097152}}}}"#,
+                    server.uri(),
+                    TEST_DIGEST,
+                    EROFS_LAYER_MEDIA_TYPE
                 )
                 .into_bytes(),
             })
@@ -457,49 +436,71 @@ mod tests {
 
         assert_eq!(response.status, 200);
         assert_eq!(registry.len().await, 1);
+        assert!(server.received_requests().await.unwrap().is_empty());
         let value: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(value["layers"][0]["index"], 0);
-        assert_eq!(value["layers"][0]["blob_digest"], "sha256:layer");
+        assert_eq!(value["layers"][0]["blob_digest"], TEST_DIGEST);
         assert_eq!(value["layers"][0]["blob_size"], 4097);
         assert_eq!(value["layers"][0]["pmem_size"], 2 * 1024 * 1024);
-        assert_eq!(value["layers"][0]["instance_id"], "erofs-sha256-layer");
+        assert_eq!(value["layers"][0]["instance_id"], TEST_INSTANCE_ID);
         assert!(PathBuf::from(value["layers"][0]["sparse_path"].as_str().unwrap()).exists());
         assert!(PathBuf::from(value["layers"][0]["bitmap_path"].as_str().unwrap()).exists());
     }
 
     #[tokio::test]
+    async fn prepare_image_requires_explicit_layers() {
+        let control = ControlPlane::new(InstanceRegistry::new(None));
+
+        let err = control
+            .handle_request(Request {
+                method: "POST".to_string(),
+                path: "/api/v1/images/prepare".to_string(),
+                body: br#"{"image_ref":"registry.example.com/ns/image:tag"}"#.to_vec(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::BadRequest(msg) if msg == "layers is required"));
+    }
+
+    #[tokio::test]
+    async fn prepare_image_rejects_non_erofs_descriptor() {
+        let server = MockServer::start().await;
+        let cache = tempdir().unwrap();
+        let registry = InstanceRegistry::new(None);
+        let control = ControlPlane::with_image_cache_dir(registry.clone(), cache.path().into());
+
+        let err = control
+            .handle_request(Request {
+                method: "POST".to_string(),
+                path: "/api/v1/images/prepare".to_string(),
+                body: format!(
+                    r#"{{"image_ref":"{}/ns/image:tag","layers":[{{"index":0,"digest":"{}","size":4097,"media_type":"application/vnd.oci.image.layer.v1.tar"}}]}}"#,
+                    server.uri(),
+                    TEST_DIGEST
+                )
+                .into_bytes(),
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(registry.len().await, 0);
+        assert!(matches!(err, Error::BadRequest(_)));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn prepare_image_is_idempotent_for_same_layer() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v2/ns/image/manifests/tag"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "schemaVersion": 2,
-                "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                "config": {
-                    "mediaType": "application/vnd.oci.image.config.v1+json",
-                    "digest": "sha256:config",
-                    "size": 16
-                },
-                "layers": [{
-                    "mediaType": EROFS_LAYER_MEDIA_TYPE,
-                    "digest": "sha256:layer",
-                    "size": 4097
-                }]
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/v2/ns/image/blobs/sha256:config"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-            .mount(&server)
-            .await;
         let cache = tempdir().unwrap();
         let registry = InstanceRegistry::new(None);
         let control = ControlPlane::with_image_cache_dir(registry.clone(), cache.path().into());
 
         let body = format!(
-            r#"{{"image_ref":"{}/ns/image:tag","fetch":{{"unit_bytes":1048576}},"pmem":{{"alignment_bytes":2097152}}}}"#,
-            server.uri()
+            r#"{{"image_ref":"{}/ns/image:tag","layers":[{{"index":0,"digest":"{}","size":4097,"media_type":"{}"}}],"fetch":{{"unit_bytes":1048576}},"pmem":{{"alignment_bytes":2097152}}}}"#,
+            server.uri(),
+            TEST_DIGEST,
+            EROFS_LAYER_MEDIA_TYPE
         )
         .into_bytes();
         let first = control
@@ -521,6 +522,61 @@ mod tests {
 
         assert_eq!(registry.len().await, 1);
         assert_eq!(first.body, second.body);
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepare_image_reuses_content_for_same_digest_across_images_and_indexes() {
+        let server = MockServer::start().await;
+        let cache = tempdir().unwrap();
+        let registry = InstanceRegistry::new(None);
+        let control = ControlPlane::with_image_cache_dir(registry.clone(), cache.path().into());
+
+        let first = control
+            .handle_request(Request {
+                method: "POST".to_string(),
+                path: "/api/v1/images/prepare".to_string(),
+                body: format!(
+                    r#"{{"image_ref":"{}/ns/image:tag","layers":[{{"index":0,"digest":"{}","size":4097,"media_type":"{}"}}]}}"#,
+                    server.uri(),
+                    TEST_DIGEST,
+                    EROFS_LAYER_MEDIA_TYPE
+                )
+                .into_bytes(),
+            })
+            .await
+            .unwrap();
+        let second = control
+            .handle_request(Request {
+                method: "POST".to_string(),
+                path: "/api/v1/images/prepare".to_string(),
+                body: format!(
+                    r#"{{"image_ref":"{}/other/image:tag","layers":[{{"index":3,"digest":"{}","size":4097,"media_type":"{}"}}]}}"#,
+                    server.uri(),
+                    TEST_DIGEST,
+                    EROFS_LAYER_MEDIA_TYPE
+                )
+                .into_bytes(),
+            })
+            .await
+            .unwrap();
+
+        let first_value: serde_json::Value = serde_json::from_slice(&first.body).unwrap();
+        let second_value: serde_json::Value = serde_json::from_slice(&second.body).unwrap();
+        assert_eq!(registry.len().await, 1);
+        assert_eq!(
+            first_value["layers"][0]["sparse_path"],
+            second_value["layers"][0]["sparse_path"]
+        );
+        assert_eq!(
+            first_value["layers"][0]["bitmap_path"],
+            second_value["layers"][0]["bitmap_path"]
+        );
+        assert_eq!(
+            first_value["layers"][0]["instance_id"],
+            second_value["layers"][0]["instance_id"]
+        );
+        assert_eq!(second_value["layers"][0]["index"], 3);
     }
 
     #[test]

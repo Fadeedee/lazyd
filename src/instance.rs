@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::fs::File;
+use std::io::Write;
 use std::os::unix::fs::FileExt;
-use std::path::PathBuf;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -16,6 +18,8 @@ use crate::remote::oci::OciRemoteBackend;
 use crate::remote::{AuthConfig, BlobDescriptor, RemoteBackend, RemoteSource};
 
 pub const DEFAULT_FETCH_UNIT_BYTES: u64 = BITMAP_UNIT_BYTES;
+const PERSISTED_INSTANCE_VERSION: u32 = 1;
+const PERSISTED_INSTANCE_FILE: &str = "instance.json";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -38,6 +42,22 @@ pub struct InstanceConfig {
     pub fetch: FetchConfig,
     #[serde(default)]
     pub trigger_mode: TriggerMode,
+}
+
+impl InstanceConfig {
+    fn describes_same_content(&self, other: &Self) -> bool {
+        self.target_path == other.target_path
+            && self.blob == other.blob
+            && self.fetch == other.fetch
+            && self.trigger_mode == other.trigger_mode
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedInstance {
+    version: u32,
+    instance_id: String,
+    config: InstanceConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,7 +145,24 @@ impl InstanceRegistry {
         self.inner.instances.read().await.get(instance_id).cloned()
     }
 
-    pub async fn register(&self, instance_id: String, mut config: InstanceConfig) -> Result<()> {
+    pub async fn register(&self, instance_id: String, config: InstanceConfig) -> Result<()> {
+        self.register_inner(instance_id, config, false).await
+    }
+
+    pub async fn register_persistent(
+        &self,
+        instance_id: String,
+        config: InstanceConfig,
+    ) -> Result<()> {
+        self.register_inner(instance_id, config, true).await
+    }
+
+    async fn register_inner(
+        &self,
+        instance_id: String,
+        mut config: InstanceConfig,
+        persist: bool,
+    ) -> Result<()> {
         if config.target_path.as_os_str().is_empty() {
             return Err(Error::BadRequest("target_path is required".to_string()));
         }
@@ -139,16 +176,23 @@ impl InstanceRegistry {
         config.instance_id = instance_id.clone();
         let mut instances = self.inner.instances.write().await;
         if let Some(existing) = instances.get(&instance_id) {
-            if existing.config == config {
-                return Ok(());
+            // Source and auth locate immutable content; they are not part of its identity.
+            if !existing.config.describes_same_content(&config) {
+                return Err(Error::Conflict(
+                    "instance already exists with different config".to_string(),
+                ));
             }
-            return Err(Error::Conflict(
-                "instance already exists with different config".to_string(),
-            ));
         }
 
-        let instance = Arc::new(Instance::open(config)?);
-        if instance.config.trigger_mode == TriggerMode::Fanotify {
+        // Reopening a compatible instance refreshes its registry source/auth while
+        // preserving the content identity and on-disk ready map.
+        let instance = Arc::new(Instance::open(config.clone())?);
+        if persist {
+            persist_instance(&instance_id, &config)?;
+        }
+        if !instances.contains_key(&instance_id)
+            && instance.config.trigger_mode == TriggerMode::Fanotify
+        {
             if let Some(fanotify) = &self.inner.fanotify {
                 fanotify.mark(instance_id.clone(), &instance.config.target_path)?;
             }
@@ -157,15 +201,120 @@ impl InstanceRegistry {
         Ok(())
     }
 
+    pub async fn restore_persisted(&self, cache_root: &Path) -> Result<usize> {
+        if !cache_root.exists() {
+            return Ok(0);
+        }
+        let mut state_paths = Vec::new();
+        for entry in std::fs::read_dir(cache_root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                let state_path = entry.path().join(PERSISTED_INSTANCE_FILE);
+                if state_path.exists() {
+                    state_paths.push(state_path);
+                }
+            }
+        }
+        state_paths.sort();
+
+        let mut restored = 0;
+        for state_path in state_paths {
+            let bytes = std::fs::read(&state_path)?;
+            let state: PersistedInstance = serde_json::from_slice(&bytes)?;
+            validate_persisted_instance(&state_path, &state)?;
+            self.register(state.instance_id, state.config).await?;
+            restored += 1;
+        }
+        Ok(restored)
+    }
+
     pub async fn unregister(&self, instance_id: &str) -> Result<()> {
         let removed = self.inner.instances.write().await.remove(instance_id);
-        if let (Some(instance), Some(fanotify)) = (removed, &self.inner.fanotify) {
+        if let Some(instance) = removed {
             if instance.config.trigger_mode == TriggerMode::Fanotify {
-                fanotify.unmark(&instance.config.target_path)?;
+                if let Some(fanotify) = &self.inner.fanotify {
+                    fanotify.unmark(&instance.config.target_path)?;
+                }
             }
+            remove_persisted_instance(&instance.config.target_path)?;
         }
         Ok(())
     }
+}
+
+fn persisted_instance_path(target_path: &Path) -> Result<PathBuf> {
+    let parent = target_path.parent().ok_or_else(|| {
+        Error::BadRequest("instance target_path has no parent directory".to_string())
+    })?;
+    Ok(parent.join(PERSISTED_INSTANCE_FILE))
+}
+
+fn persist_instance(instance_id: &str, config: &InstanceConfig) -> Result<()> {
+    let path = persisted_instance_path(&config.target_path)?;
+    let parent = path.parent().ok_or_else(|| {
+        Error::BadRequest("persisted instance path has no parent directory".to_string())
+    })?;
+    let tmp = parent.join(format!(".{PERSISTED_INSTANCE_FILE}.tmp"));
+    let state = PersistedInstance {
+        version: PERSISTED_INSTANCE_VERSION,
+        instance_id: instance_id.to_string(),
+        config: config.clone(),
+    };
+    let encoded = serde_json::to_vec_pretty(&state)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    file.write_all(&encoded)?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, &path)?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn remove_persisted_instance(target_path: &Path) -> Result<()> {
+    let path = persisted_instance_path(target_path)?;
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+        if let Some(parent) = path.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_persisted_instance(path: &Path, state: &PersistedInstance) -> Result<()> {
+    if state.version != PERSISTED_INSTANCE_VERSION {
+        return Err(Error::Conflict(format!(
+            "persisted instance {} has unsupported version {}",
+            path.display(),
+            state.version
+        )));
+    }
+    let cache_dir = path.parent().ok_or_else(|| {
+        Error::BadRequest("persisted instance path has no parent directory".to_string())
+    })?;
+    let cache_key = crate::prepare::cache_key(&state.config.blob.digest)?;
+    let expected_dir = cache_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Error::BadRequest("cache directory name is not UTF-8".to_string()))?;
+    if expected_dir != cache_key
+        || state.instance_id != crate::prepare::instance_id(&cache_key)
+        || state.config.target_path != cache_dir.join("layer.erofs")
+    {
+        return Err(Error::Conflict(format!(
+            "persisted instance {} does not match its cache directory",
+            path.display()
+        )));
+    }
+    RangeMap::validate_existing(
+        &state.config.target_path,
+        &state.config.blob,
+        state.config.fetch.unit_bytes,
+    )
 }
 
 impl Instance {
@@ -449,6 +598,60 @@ mod tests {
             registry.register("one".to_string(), conflict).await,
             Err(Error::Conflict(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn compatible_registration_refreshes_remote_source() {
+        let file = NamedTempFile::new().unwrap();
+        file.as_file().set_len(128).unwrap();
+        let registry = InstanceRegistry::new(None);
+        let first = config(file.path().to_path_buf());
+        registry
+            .register("one".to_string(), first.clone())
+            .await
+            .unwrap();
+
+        let mut refreshed = first;
+        refreshed.source = RemoteSource::OciRegistry {
+            image_ref: "registry.example.com/other/image:tag".to_string(),
+            hosts_dir: Some("/etc/containerd/certs.d".to_string()),
+        };
+        registry
+            .register("one".to_string(), refreshed.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            registry.get("one").await.unwrap().config.source,
+            refreshed.source
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_instance_is_restored_after_registry_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let cache_key = "sha256-1111111111111111111111111111111111111111111111111111111111111111";
+        let cache_dir = root.path().join(cache_key);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let target = cache_dir.join("layer.erofs");
+        File::create(&target).unwrap().set_len(128).unwrap();
+        let mut persistent = config(target);
+        persistent.blob.digest =
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111".to_string();
+        let instance_id = format!("erofs-{cache_key}");
+
+        let registry = InstanceRegistry::new(None);
+        registry
+            .register_persistent(instance_id.clone(), persistent.clone())
+            .await
+            .unwrap();
+        drop(registry);
+
+        let restored = InstanceRegistry::new(None);
+        assert_eq!(restored.restore_persisted(root.path()).await.unwrap(), 1);
+        let instance = restored.get(&instance_id).await.unwrap();
+        assert_eq!(instance.config.source, persistent.source);
+        assert_eq!(instance.config.auth, persistent.auth);
     }
 
     #[tokio::test]

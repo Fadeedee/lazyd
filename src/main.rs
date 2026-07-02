@@ -56,6 +56,10 @@ async fn main() -> Result<()> {
     };
 
     let registry = InstanceRegistry::new(fanotify.clone());
+    let restored = registry
+        .restore_persisted(std::path::Path::new(control::DEFAULT_IMAGE_CACHE_DIR))
+        .await?;
+    info!(restored, "restored persistent lazy instances");
     if let Some(backend) = fanotify {
         backend.spawn_event_loop(registry.clone());
     }
