@@ -141,6 +141,7 @@ impl RangeMap {
         let bytes = vec![value; slot_end - slot_start];
         self.file
             .write_all_at(&bytes, HEADER_SIZE as u64 + slot_start as u64)?;
+        self.file.sync_data()?;
 
         let mut slots = self.slots.lock().unwrap();
         slots[slot_start..slot_end].fill(value);

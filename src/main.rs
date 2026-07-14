@@ -2,6 +2,7 @@ mod control;
 mod data;
 mod error;
 mod extent_layout;
+mod extent_map;
 mod fanotify;
 mod instance;
 mod prepare;

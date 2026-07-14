@@ -1,8 +1,11 @@
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::extent_layout::DataExtent;
+use crate::extent_map::ExtentMap;
 use crate::instance::DEFAULT_FETCH_UNIT_BYTES;
 use crate::range_map::{RangeMap, bitmap_path, validate_fetch_unit_bytes};
 use crate::remote::{AuthConfig, BlobDescriptor, RemoteSource};
@@ -96,8 +99,14 @@ pub fn prepare_cache_layers(
     cache_root: &Path,
     request: &PrepareImageRequest,
     layers: &[PrepareLayerDescriptor],
+    canonical_extents: Option<&[DataExtent]>,
 ) -> Result<Vec<PreparedLayer>> {
     validate_fetch_unit_bytes(request.fetch.unit_bytes)?;
+    if canonical_extents.is_some() && layers.len() != 1 {
+        return Err(Error::BadRequest(
+            "canonical extents are only supported for a single Kuasar image layer".to_string(),
+        ));
+    }
     let mut prepared = Vec::with_capacity(layers.len());
     for layer in layers {
         if layer.media_type != EROFS_LAYER_MEDIA_TYPE && layer.media_type != EROFS_IMAGE_MEDIA_TYPE
@@ -125,9 +134,17 @@ pub fn prepare_cache_layers(
             .write(true)
             .open(&sparse_path)?;
         let blob = layer.blob();
-        let opened = RangeMap::open_or_create(&sparse_path, &blob, request.fetch.unit_bytes)?;
-        if opened.needs_recovery {
-            opened.range_map.recovery_reconcile(&target)?;
+        if let Some(extents) = canonical_extents {
+            let opened =
+                ExtentMap::open_or_create(&sparse_path, &blob, Arc::<[DataExtent]>::from(extents))?;
+            if opened.needs_recovery {
+                opened.extent_map.recovery_reconcile(&target)?;
+            }
+        } else {
+            let opened = RangeMap::open_or_create(&sparse_path, &blob, request.fetch.unit_bytes)?;
+            if opened.needs_recovery {
+                opened.range_map.recovery_reconcile(&target)?;
+            }
         }
 
         prepared.push(PreparedLayer {
@@ -230,6 +247,7 @@ mod tests {
                 size: 3 * 1024 * 1024 + 1,
                 media_type: EROFS_LAYER_MEDIA_TYPE.to_string(),
             }],
+            None,
         )
         .unwrap();
 
@@ -256,6 +274,7 @@ mod tests {
                 size: 4096,
                 media_type: "application/vnd.oci.image.layer.v1.tar".to_string(),
             }],
+            None,
         )
         .unwrap_err();
 

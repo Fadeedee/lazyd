@@ -7,13 +7,14 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
 use crate::error::{Error, Result};
+use crate::extent_layout::DataExtent;
 use crate::instance::{FetchConfig, InstanceConfig, InstanceRegistry, TriggerMode};
 use crate::prepare::{
     EROFS_IMAGE_MEDIA_TYPE, EROFS_LAYER_MEDIA_TYPE, PrepareImageRequest, PrepareImageResponse,
     PrepareLayerDescriptor, prepare_cache_layers,
 };
 use crate::remote::RemoteSource;
-use crate::remote::kuasar::AcceleratorClient;
+use crate::remote::kuasar::{AcceleratorClient, MAX_RANGE_LENGTH};
 
 const DEFAULT_IMAGE_CACHE_DIR: &str = "/var/lib/lazyd/images";
 
@@ -141,9 +142,15 @@ impl ControlPlane {
         &self,
         request: PrepareImageRequest,
     ) -> Result<Vec<crate::prepare::PreparedLayer>> {
-        let (layers, source) = resolve_prepare_source(&request).await?;
+        let (layers, source, canonical_extents) = resolve_prepare_source(&request).await?;
         let _guard = self.prepare_lock.lock().await;
-        let prepared = prepare_cache_layers(&self.image_cache_dir, &request, &layers)?;
+        let prepared = prepare_cache_layers(
+            &self.image_cache_dir,
+            &request,
+            &layers,
+            canonical_extents.as_deref(),
+        )?;
+        let canonical_extents = canonical_extents.map(Arc::<[DataExtent]>::from);
         for (layer, prepared_layer) in layers.iter().zip(prepared.iter()) {
             self.registry
                 .register(
@@ -159,6 +166,7 @@ impl ControlPlane {
                         fetch: FetchConfig {
                             unit_bytes: request.fetch.unit_bytes,
                         },
+                        canonical_extents: canonical_extents.clone(),
                         trigger_mode: TriggerMode::External,
                     },
                 )
@@ -170,7 +178,11 @@ impl ControlPlane {
 
 async fn resolve_prepare_source(
     request: &PrepareImageRequest,
-) -> Result<(Vec<PrepareLayerDescriptor>, RemoteSource)> {
+) -> Result<(
+    Vec<PrepareLayerDescriptor>,
+    RemoteSource,
+    Option<Vec<DataExtent>>,
+)> {
     match &request.source {
         None => Ok((
             request.layers.clone(),
@@ -178,6 +190,7 @@ async fn resolve_prepare_source(
                 image_ref: request.image_ref.clone(),
                 hosts_dir: request.hosts_dir.clone(),
             },
+            None,
         )),
         Some(
             source @ RemoteSource::KuasarManifest {
@@ -191,11 +204,12 @@ async fn resolve_prepare_source(
             Ok((
                 vec![PrepareLayerDescriptor {
                     index: 0,
-                    digest: image.content_id,
+                    digest: image.content_id.clone(),
                     size: image.image_size,
                     media_type: EROFS_IMAGE_MEDIA_TYPE.to_string(),
                 }],
                 source.clone(),
+                Some(image.extents),
             ))
         }
         Some(RemoteSource::OciRegistry { .. }) => Err(Error::BadRequest(
@@ -234,6 +248,11 @@ fn validate_prepare_request(request: &PrepareImageRequest) -> Result<()> {
                 return Err(Error::BadRequest(
                     "kuasar-manifest image_ref must start with manifest://".to_string(),
                 ));
+            }
+            if request.fetch.unit_bytes > MAX_RANGE_LENGTH {
+                return Err(Error::BadRequest(format!(
+                    "fetch.unit_bytes exceeds the Kuasar {MAX_RANGE_LENGTH}-byte range limit"
+                )));
             }
         }
         Some(RemoteSource::OciRegistry { .. }) => {
@@ -465,6 +484,7 @@ mod tests {
                     },
                     auth: None,
                     fetch: FetchConfig::default(),
+                    canonical_extents: None,
                     trigger_mode: TriggerMode::External,
                 },
             )

@@ -16,7 +16,7 @@ use crate::extent_layout::{
 use crate::remote::{RemoteBackend, RemoteRange, RemoteSource};
 
 const PROTOCOL_VERSION: u32 = 1;
-const MAX_RANGE_LENGTH: u64 = MAX_CANONICAL_EXTENT_LENGTH;
+pub const MAX_RANGE_LENGTH: u64 = MAX_CANONICAL_EXTENT_LENGTH;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUIRED_MEMFD_SEALS: libc::c_int =
     libc::F_SEAL_WRITE | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
