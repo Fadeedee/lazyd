@@ -5,10 +5,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::instance::DEFAULT_FETCH_UNIT_BYTES;
 use crate::range_map::{RangeMap, bitmap_path, validate_fetch_unit_bytes};
-use crate::remote::{AuthConfig, BlobDescriptor};
+use crate::remote::{AuthConfig, BlobDescriptor, RemoteSource};
 use crate::{error::Error, error::Result};
 
 pub const EROFS_LAYER_MEDIA_TYPE: &str = "application/vnd.erofs.layer.v1";
+pub const EROFS_IMAGE_MEDIA_TYPE: &str = "application/vnd.erofs.image.v1";
 pub const DEFAULT_PMEM_ALIGNMENT_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -18,6 +19,8 @@ pub struct PrepareImageRequest {
     pub hosts_dir: Option<String>,
     #[serde(default)]
     pub auth: Option<AuthConfig>,
+    #[serde(default)]
+    pub source: Option<RemoteSource>,
     #[serde(default)]
     pub layers: Vec<PrepareLayerDescriptor>,
     #[serde(default)]
@@ -97,7 +100,8 @@ pub fn prepare_cache_layers(
     validate_fetch_unit_bytes(request.fetch.unit_bytes)?;
     let mut prepared = Vec::with_capacity(layers.len());
     for layer in layers {
-        if layer.media_type != EROFS_LAYER_MEDIA_TYPE {
+        if layer.media_type != EROFS_LAYER_MEDIA_TYPE && layer.media_type != EROFS_IMAGE_MEDIA_TYPE
+        {
             return Err(Error::BadRequest(format!(
                 "layer {} media type {} is not native EROFS; convert rootfs to native EROFS and push first",
                 layer.index, layer.media_type
@@ -207,6 +211,7 @@ mod tests {
             image_ref: "registry.example.com/ns/image:tag".to_string(),
             hosts_dir: None,
             auth: None,
+            source: None,
             layers: Vec::new(),
             fetch: PrepareFetchConfig { unit_bytes },
             pmem: PreparePmemConfig { alignment_bytes },

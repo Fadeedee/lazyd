@@ -8,8 +8,12 @@ use tokio::sync::Mutex;
 
 use crate::error::{Error, Result};
 use crate::instance::{FetchConfig, InstanceConfig, InstanceRegistry, TriggerMode};
-use crate::prepare::{PrepareImageRequest, PrepareImageResponse, prepare_cache_layers};
+use crate::prepare::{
+    EROFS_IMAGE_MEDIA_TYPE, EROFS_LAYER_MEDIA_TYPE, PrepareImageRequest, PrepareImageResponse,
+    PrepareLayerDescriptor, prepare_cache_layers,
+};
 use crate::remote::RemoteSource;
+use crate::remote::kuasar::AcceleratorClient;
 
 const DEFAULT_IMAGE_CACHE_DIR: &str = "/var/lib/lazyd/images";
 
@@ -137,9 +141,10 @@ impl ControlPlane {
         &self,
         request: PrepareImageRequest,
     ) -> Result<Vec<crate::prepare::PreparedLayer>> {
+        let (layers, source) = resolve_prepare_source(&request).await?;
         let _guard = self.prepare_lock.lock().await;
-        let prepared = prepare_cache_layers(&self.image_cache_dir, &request, &request.layers)?;
-        for (layer, prepared_layer) in request.layers.iter().zip(prepared.iter()) {
+        let prepared = prepare_cache_layers(&self.image_cache_dir, &request, &layers)?;
+        for (layer, prepared_layer) in layers.iter().zip(prepared.iter()) {
             self.registry
                 .register(
                     prepared_layer.instance_id.clone(),
@@ -147,11 +152,10 @@ impl ControlPlane {
                         instance_id: String::new(),
                         target_path: prepared_layer.sparse_path.clone(),
                         blob: layer.blob(),
-                        source: RemoteSource::OciRegistry {
-                            image_ref: request.image_ref.clone(),
-                            hosts_dir: request.hosts_dir.clone(),
-                        },
-                        auth: request.auth.clone(),
+                        source: source.clone(),
+                        auth: matches!(&source, RemoteSource::OciRegistry { .. })
+                            .then(|| request.auth.clone())
+                            .flatten(),
                         fetch: FetchConfig {
                             unit_bytes: request.fetch.unit_bytes,
                         },
@@ -164,12 +168,79 @@ impl ControlPlane {
     }
 }
 
+async fn resolve_prepare_source(
+    request: &PrepareImageRequest,
+) -> Result<(Vec<PrepareLayerDescriptor>, RemoteSource)> {
+    match &request.source {
+        None => Ok((
+            request.layers.clone(),
+            RemoteSource::OciRegistry {
+                image_ref: request.image_ref.clone(),
+                hosts_dir: request.hosts_dir.clone(),
+            },
+        )),
+        Some(
+            source @ RemoteSource::KuasarManifest {
+                manifest_keys,
+                accelerator_socket,
+            },
+        ) => {
+            let image = AcceleratorClient::new(PathBuf::from(accelerator_socket))?
+                .describe(manifest_keys)
+                .await?;
+            Ok((
+                vec![PrepareLayerDescriptor {
+                    index: 0,
+                    digest: image.content_id,
+                    size: image.image_size,
+                    media_type: EROFS_IMAGE_MEDIA_TYPE.to_string(),
+                }],
+                source.clone(),
+            ))
+        }
+        Some(RemoteSource::OciRegistry { .. }) => Err(Error::BadRequest(
+            "OCI prepare uses top-level image_ref/hosts_dir and explicit layers".to_string(),
+        )),
+    }
+}
+
 fn validate_prepare_request(request: &PrepareImageRequest) -> Result<()> {
     if request.image_ref.trim().is_empty() {
         return Err(Error::BadRequest("image_ref is required".to_string()));
     }
-    if request.layers.is_empty() {
-        return Err(Error::BadRequest("layers is required".to_string()));
+    match &request.source {
+        None => {
+            if request.layers.is_empty() {
+                return Err(Error::BadRequest("layers is required".to_string()));
+            }
+            if request
+                .layers
+                .iter()
+                .any(|layer| layer.media_type != EROFS_LAYER_MEDIA_TYPE)
+            {
+                return Err(Error::BadRequest(
+                    "OCI rootfs descriptors must use native EROFS layer media type; convert rootfs to native EROFS and push first"
+                        .to_string(),
+                ));
+            }
+        }
+        Some(RemoteSource::KuasarManifest { .. }) => {
+            if !request.layers.is_empty() {
+                return Err(Error::BadRequest(
+                    "layers must be omitted for a kuasar-manifest source".to_string(),
+                ));
+            }
+            if !request.image_ref.starts_with("manifest://") {
+                return Err(Error::BadRequest(
+                    "kuasar-manifest image_ref must start with manifest://".to_string(),
+                ));
+            }
+        }
+        Some(RemoteSource::OciRegistry { .. }) => {
+            return Err(Error::BadRequest(
+                "OCI prepare uses top-level image_ref/hosts_dir and explicit layers".to_string(),
+            ));
+        }
     }
     if request.fetch.unit_bytes == 0 {
         return Err(Error::BadRequest(
@@ -337,7 +408,13 @@ async fn write_response(stream: &mut UnixStream, response: Result<Response>) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CString;
+    use std::fs::File;
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+
     use super::*;
+    use crate::data::SeqpacketListener;
     use crate::instance::InstanceRegistry;
     use crate::prepare::EROFS_LAYER_MEDIA_TYPE;
     use crate::remote::{BlobDescriptor, RemoteSource};
@@ -561,6 +638,90 @@ mod tests {
         assert_eq!(second_value["layers"][0]["index"], 3);
     }
 
+    #[tokio::test]
+    async fn prepare_kuasar_manifest_uses_described_content_identity() {
+        const KEY: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("accelerator.sock");
+        let listener = SeqpacketListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let stream = listener.accept().unwrap();
+                let request: serde_json::Value =
+                    serde_json::from_slice(&stream.recv_packet().unwrap()).unwrap();
+                assert_eq!(request["op"], "describe");
+                assert_eq!(request["manifest_keys"], serde_json::json!([KEY]));
+                let layout = sealed_layout_fd(4097, &[(0, 4097)]);
+                stream
+                    .send_packet_with_fd(
+                        serde_json::to_string(&serde_json::json!({
+                            "protocol_version": 1,
+                            "request_id": request["request_id"],
+                            "op": "describe_ok",
+                            "content_id": format!("sha256:{}", "a".repeat(64)),
+                            "image_size": 4097,
+                            "layout_format": "kuasar-canonical-extents-v1",
+                            "extent_count": 1,
+                            "layout_size": 48
+                        }))
+                        .unwrap()
+                        .as_bytes(),
+                        layout.as_raw_fd(),
+                    )
+                    .unwrap();
+            }
+        });
+        let cache = tempdir().unwrap();
+        let registry = InstanceRegistry::new(None);
+        let control = ControlPlane::with_image_cache_dir(registry.clone(), cache.path().into());
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "image_ref": format!("manifest://{KEY}"),
+            "source": {
+                "type": "kuasar-manifest",
+                "manifest_keys": [KEY],
+                "accelerator_socket": socket
+            },
+            "fetch": {"unit_bytes": 1048576},
+            "pmem": {"alignment_bytes": 2097152}
+        }))
+        .unwrap();
+        let response = control
+            .handle_request(Request {
+                method: "POST".to_string(),
+                path: "/api/v1/images/prepare".to_string(),
+                body: body.clone(),
+            })
+            .await
+            .unwrap();
+        let repeated = control
+            .handle_request(Request {
+                method: "POST".to_string(),
+                path: "/api/v1/images/prepare".to_string(),
+                body,
+            })
+            .await
+            .unwrap();
+
+        let value: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, repeated.body);
+        assert_eq!(registry.len().await, 1);
+        assert_eq!(value["layers"].as_array().unwrap().len(), 1);
+        assert_eq!(value["layers"][0]["index"], 0);
+        assert_eq!(
+            value["layers"][0]["blob_digest"],
+            format!("sha256:{}", "a".repeat(64))
+        );
+        assert_eq!(value["layers"][0]["blob_size"], 4097);
+        assert_eq!(value["layers"][0]["pmem_size"], 2 * 1024 * 1024);
+        assert_eq!(
+            value["layers"][0]["media_type"],
+            "application/vnd.erofs.image.v1"
+        );
+        server.join().unwrap();
+    }
+
     #[test]
     fn parses_content_length() {
         assert_eq!(
@@ -581,5 +742,37 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 400 Bad Request"));
         assert!(text.contains("Content-Type: application/json"));
         assert!(text.ends_with("{\"error\":\"target_path is required\"}"));
+    }
+    fn sealed_layout_fd(image_size: u64, extents: &[(u64, u64)]) -> File {
+        let mut data = vec![0; 32 + extents.len() * 16];
+        data[..8].copy_from_slice(b"KCRANGE\0");
+        data[8..12].copy_from_slice(&1u32.to_le_bytes());
+        data[12..16].copy_from_slice(&16u32.to_le_bytes());
+        data[16..24].copy_from_slice(&image_size.to_le_bytes());
+        data[24..32].copy_from_slice(&(extents.len() as u64).to_le_bytes());
+        for (index, (offset, len)) in extents.iter().copied().enumerate() {
+            let pos = 32 + index * 16;
+            data[pos..pos + 8].copy_from_slice(&offset.to_le_bytes());
+            data[pos + 8..pos + 16].copy_from_slice(&len.to_le_bytes());
+        }
+        sealed_memfd(&data)
+    }
+
+    fn sealed_memfd(data: &[u8]) -> File {
+        let name = CString::new("lazyd-control-test").unwrap();
+        let fd = unsafe {
+            libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
+        };
+        assert!(fd >= 0);
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        file.write_all(data).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let seals =
+            libc::F_SEAL_WRITE | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+        assert_eq!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) },
+            0
+        );
+        file
     }
 }
