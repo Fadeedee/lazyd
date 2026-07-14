@@ -92,7 +92,11 @@ impl DataPlane {
 
     async fn handle_stream(&self, stream: SeqpacketStream) -> Result<()> {
         loop {
-            self.handle_stream_once(&stream).await?;
+            match self.handle_stream_once(&stream).await {
+                Ok(()) => {}
+                Err(Error::PeerClosed) => return Ok(()),
+                Err(err) => return Err(err),
+            }
         }
     }
 
@@ -304,7 +308,7 @@ impl SeqpacketStream {
             iov_base: bytes.as_ptr() as *mut libc::c_void,
             iov_len: bytes.len(),
         };
-        let mut control = vec![0u8; cmsg_space(size_of::<RawFd>())];
+        let mut control = vec![0u8; cmsg_space(2 * size_of::<RawFd>())];
         let mut msg = unsafe { MaybeUninit::<libc::msghdr>::zeroed().assume_init() };
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
@@ -362,37 +366,66 @@ impl SeqpacketStream {
         if received < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
+        let mut fds = received_fds(&msg)?;
         if msg.msg_flags & libc::MSG_CTRUNC != 0 {
             return Err(Error::Remote("truncated fd control message".to_string()));
         }
         if msg.msg_flags & libc::MSG_TRUNC != 0 {
             return Err(Error::Remote("truncated seqpacket payload".to_string()));
         }
-        let fd = unsafe {
-            let cmsg = libc::CMSG_FIRSTHDR(&msg);
-            if cmsg.is_null() {
-                None
-            } else if (*cmsg).cmsg_level == libc::SOL_SOCKET
-                && (*cmsg).cmsg_type == libc::SCM_RIGHTS
-                && (*cmsg).cmsg_len >= libc::CMSG_LEN(size_of::<RawFd>() as _) as _
-            {
-                let mut fd = -1;
-                std::ptr::copy_nonoverlapping(
-                    libc::CMSG_DATA(cmsg),
-                    &mut fd as *mut RawFd as *mut u8,
-                    size_of::<RawFd>(),
-                );
-                (fd >= 0).then(|| OwnedFd::from_raw_fd(fd))
-            } else {
-                None
-            }
-        };
+        if fds.len() > 1 {
+            return Err(Error::Remote(format!(
+                "seqpacket response must carry zero or exactly one fd, received {}",
+                fds.len()
+            )));
+        }
+        let fd = fds.pop();
         if received == 0 {
-            return Err(Error::Remote("data peer closed".to_string()));
+            return Err(Error::PeerClosed);
         }
         buf.truncate(received as usize);
         Ok((buf, fd))
     }
+}
+
+fn received_fds(msg: &libc::msghdr) -> Result<Vec<OwnedFd>> {
+    let mut fds = Vec::new();
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level != libc::SOL_SOCKET || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
+                return Err(Error::Remote(
+                    "seqpacket response carried unsupported control data".to_string(),
+                ));
+            }
+            let header_len = libc::CMSG_LEN(0) as usize;
+            let cmsg_len = (*cmsg).cmsg_len as usize;
+            if cmsg_len < header_len {
+                return Err(Error::Remote(
+                    "seqpacket response carried malformed fd control data".to_string(),
+                ));
+            }
+            let data_len = cmsg_len - header_len;
+            if !data_len.is_multiple_of(size_of::<RawFd>()) {
+                return Err(Error::Remote(
+                    "seqpacket response carried malformed fd array".to_string(),
+                ));
+            }
+            let count = data_len / size_of::<RawFd>();
+            let data = libc::CMSG_DATA(cmsg) as *const RawFd;
+            for index in 0..count {
+                let fd = *data.add(index);
+                if fd < 0 {
+                    return Err(Error::Remote(
+                        "seqpacket response carried an invalid fd".to_string(),
+                    ));
+                }
+                fds.push(OwnedFd::from_raw_fd(fd));
+            }
+            cmsg = libc::CMSG_NXTHDR(msg, cmsg);
+        }
+    }
+    Ok(fds)
 }
 
 fn cmsg_space(len: usize) -> usize {
@@ -526,6 +559,24 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[tokio::test]
+    async fn data_stream_treats_peer_close_as_normal_completion() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lazyd-data.sock");
+        let listener = SeqpacketListener::bind(&path).unwrap();
+        let client = SeqpacketStream::connect(&path).unwrap();
+        let stream = tokio::task::spawn_blocking(move || listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(client);
+
+        let data = DataPlane::new(InstanceRegistry::new(None));
+        data.handle_stream(stream)
+            .await
+            .expect("a normal peer close must not be reported as a stream failure");
+    }
+
     #[test]
     fn seqpacket_can_pass_file_descriptor() {
         use std::io::{Read, Seek, SeekFrom, Write};
@@ -553,6 +604,63 @@ mod tests {
         received.read_to_string(&mut text).unwrap();
         assert_eq!(text, "fd-data");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn seqpacket_rejects_multiple_file_descriptors() {
+        use std::os::fd::AsRawFd;
+        use tempfile::NamedTempFile;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lazyd-data.sock");
+        let listener = SeqpacketListener::bind(&path).unwrap();
+        let first = NamedTempFile::new().unwrap();
+        let second = NamedTempFile::new().unwrap();
+        let fds = [first.as_file().as_raw_fd(), second.as_file().as_raw_fd()];
+
+        let server = std::thread::spawn(move || {
+            let stream = listener.accept().unwrap();
+            send_packet_with_fds(&stream, b"bad", &fds);
+        });
+
+        let client = SeqpacketStream::connect(&path).unwrap();
+        let error = client.recv_packet_with_fd().unwrap_err();
+
+        assert!(error.to_string().contains("exactly one fd"), "{error}");
+        server.join().unwrap();
+    }
+
+    fn send_packet_with_fds(stream: &SeqpacketStream, bytes: &[u8], fds: &[RawFd]) {
+        let mut iov = libc::iovec {
+            iov_base: bytes.as_ptr() as *mut libc::c_void,
+            iov_len: bytes.len(),
+        };
+        let fd_bytes = std::mem::size_of_val(fds);
+        let mut control = vec![0u8; cmsg_space(fd_bytes)];
+        let mut msg = unsafe { MaybeUninit::<libc::msghdr>::zeroed().assume_init() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = control.len();
+
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            assert!(!cmsg.is_null());
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(fd_bytes as _) as _;
+            std::ptr::copy_nonoverlapping(
+                fds.as_ptr() as *const u8,
+                libc::CMSG_DATA(cmsg),
+                fd_bytes,
+            );
+            msg.msg_controllen = (*cmsg).cmsg_len;
+        }
+
+        assert_eq!(
+            unsafe { libc::sendmsg(stream.fd.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) },
+            bytes.len() as isize
+        );
     }
 
     #[tokio::test]
@@ -596,6 +704,7 @@ mod tests {
                     fetch: FetchConfig {
                         unit_bytes: 1024 * 1024,
                     },
+                    canonical_extents: None,
                     trigger_mode: TriggerMode::External,
                 },
             )
@@ -695,6 +804,7 @@ mod tests {
                     fetch: FetchConfig {
                         unit_bytes: 1024 * 1024,
                     },
+                    canonical_extents: None,
                     trigger_mode: TriggerMode::External,
                 },
             )

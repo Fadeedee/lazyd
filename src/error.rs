@@ -10,6 +10,7 @@ pub enum Error {
     Io(std::io::Error),
     Json(serde_json::Error),
     Http(reqwest::Error),
+    PeerClosed,
     Remote(String),
     Fanotify(String),
 }
@@ -20,9 +21,12 @@ impl Error {
             Self::BadRequest(_) => 400,
             Self::NotFound(_) => 404,
             Self::Conflict(_) => 409,
-            Self::Io(_) | Self::Json(_) | Self::Http(_) | Self::Remote(_) | Self::Fanotify(_) => {
-                500
-            }
+            Self::Io(_)
+            | Self::Json(_)
+            | Self::Http(_)
+            | Self::PeerClosed
+            | Self::Remote(_)
+            | Self::Fanotify(_) => 500,
         }
     }
 
@@ -36,6 +40,7 @@ impl Error {
             Self::Io(err) => err.to_string(),
             Self::Json(err) => err.to_string(),
             Self::Http(err) => err.to_string(),
+            Self::PeerClosed => "data peer closed".to_string(),
         }
     }
 }
