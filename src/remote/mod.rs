@@ -1,3 +1,4 @@
+pub mod kuasar;
 pub mod oci;
 
 use std::fs::File;

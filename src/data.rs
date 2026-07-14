@@ -3,6 +3,7 @@ use std::mem::{MaybeUninit, size_of};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -228,8 +229,7 @@ impl SeqpacketListener {
 }
 
 impl SeqpacketStream {
-    #[cfg(test)]
-    fn connect(path: &Path) -> Result<Self> {
+    pub(crate) fn connect(path: &Path) -> Result<Self> {
         let fd = create_seqpacket_socket()?;
         let (addr, len) = sockaddr_un(path)?;
         let ret = unsafe {
@@ -243,6 +243,35 @@ impl SeqpacketStream {
             return Err(std::io::Error::last_os_error().into());
         }
         Ok(Self { fd })
+    }
+
+    pub(crate) fn set_timeout(&self, timeout: Duration) -> Result<()> {
+        if timeout.is_zero() {
+            return Err(Error::BadRequest(
+                "seqpacket timeout must be greater than zero".to_string(),
+            ));
+        }
+        let seconds = libc::time_t::try_from(timeout.as_secs())
+            .map_err(|_| Error::BadRequest("seqpacket timeout is too large".to_string()))?;
+        let value = libc::timeval {
+            tv_sec: seconds,
+            tv_usec: timeout.subsec_micros().into(),
+        };
+        for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+            let ret = unsafe {
+                libc::setsockopt(
+                    self.fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    option,
+                    &value as *const libc::timeval as *const libc::c_void,
+                    size_of::<libc::timeval>() as libc::socklen_t,
+                )
+            };
+            if ret < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        Ok(())
     }
 
     pub fn send_packet(&self, bytes: &[u8]) -> Result<()> {
@@ -328,12 +357,16 @@ impl SeqpacketStream {
         msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
         msg.msg_controllen = control.len();
 
-        let received = unsafe { libc::recvmsg(self.fd.as_raw_fd(), &mut msg, 0) };
+        let received =
+            unsafe { libc::recvmsg(self.fd.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
         if received < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
         if msg.msg_flags & libc::MSG_CTRUNC != 0 {
             return Err(Error::Remote("truncated fd control message".to_string()));
+        }
+        if msg.msg_flags & libc::MSG_TRUNC != 0 {
+            return Err(Error::Remote("truncated seqpacket payload".to_string()));
         }
         let fd = unsafe {
             let cmsg = libc::CMSG_FIRSTHDR(&msg);

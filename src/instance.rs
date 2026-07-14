@@ -12,6 +12,7 @@ use crate::data::FetchRange;
 use crate::error::{Error, Result};
 use crate::fanotify::FanotifyBackend;
 use crate::range_map::{BITMAP_UNIT_BYTES, RangeMap, validate_fetch_unit_bytes};
+use crate::remote::kuasar::KuasarRemoteBackend;
 use crate::remote::oci::OciRemoteBackend;
 use crate::remote::{AuthConfig, BlobDescriptor, RemoteBackend, RemoteRange, RemoteSource};
 
@@ -180,11 +181,17 @@ impl Instance {
         if opened.needs_recovery {
             opened.range_map.recovery_reconcile(&target)?;
         }
-        let remote = Arc::new(OciRemoteBackend::from_config(
-            &config.blob,
-            &config.source,
-            config.auth.clone(),
-        )?) as Arc<dyn RemoteBackend>;
+        let remote = match &config.source {
+            RemoteSource::OciRegistry { .. } => Arc::new(OciRemoteBackend::from_config(
+                &config.blob,
+                &config.source,
+                config.auth.clone(),
+            )?) as Arc<dyn RemoteBackend>,
+            RemoteSource::KuasarManifest { .. } => {
+                Arc::new(KuasarRemoteBackend::from_source(&config.source)?)
+                    as Arc<dyn RemoteBackend>
+            }
+        };
         Ok(Self::with_remote_and_range_map(
             config,
             target,

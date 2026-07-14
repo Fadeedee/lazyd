@@ -1,6 +1,7 @@
 mod control;
 mod data;
 mod error;
+mod extent_layout;
 mod fanotify;
 mod instance;
 mod prepare;
