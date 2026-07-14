@@ -12,7 +12,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, RANGE, WWW_AUTHENTICATE}
 use reqwest::{Client, Response, StatusCode, Url};
 
 use crate::error::{Error, Result};
-use crate::remote::{AuthConfig, BlobDescriptor, RemoteBackend, RemoteSource};
+use crate::remote::{AuthConfig, BlobDescriptor, RemoteBackend, RemoteRange, RemoteSource};
 
 pub struct OciRemoteBackend {
     client: Client,
@@ -30,7 +30,12 @@ impl OciRemoteBackend {
         let RemoteSource::OciRegistry {
             image_ref,
             hosts_dir,
-        } = source;
+        } = source
+        else {
+            return Err(Error::BadRequest(
+                "OCI backend requires an oci-registry source".to_string(),
+            ));
+        };
         let blob_url = build_blob_url(image_ref, hosts_dir.as_deref(), &blob.digest)?;
         Ok(Self {
             client: Client::new(),
@@ -179,9 +184,9 @@ where
 
 #[async_trait::async_trait]
 impl RemoteBackend for OciRemoteBackend {
-    async fn read_range(&self, offset: u64, len: u64) -> Result<Bytes> {
+    async fn read_range(&self, offset: u64, len: u64) -> Result<RemoteRange> {
         if len == 0 {
-            return Ok(Bytes::new());
+            return Ok(RemoteRange::Bytes(Bytes::new()));
         }
         let end = offset
             .checked_add(len)
@@ -208,7 +213,7 @@ impl RemoteBackend for OciRemoteBackend {
                 "registry returned more bytes than requested".to_string(),
             ));
         }
-        Ok(bytes)
+        Ok(RemoteRange::Bytes(bytes))
     }
 }
 
@@ -716,10 +721,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            backend.read_range(4, 4).await.unwrap(),
-            Bytes::from_static(b"data")
-        );
+        let RemoteRange::Bytes(bytes) = backend.read_range(4, 4).await.unwrap() else {
+            panic!("OCI backend returned a staging file");
+        };
+        assert_eq!(bytes, Bytes::from_static(b"data"));
     }
 
     #[tokio::test]
@@ -763,10 +768,10 @@ mod tests {
         };
         let backend = OciRemoteBackend::from_config(&blob, &source, None).unwrap();
 
-        assert_eq!(
-            backend.read_range(4, 4).await.unwrap(),
-            Bytes::from_static(b"data")
-        );
+        let RemoteRange::Bytes(bytes) = backend.read_range(4, 4).await.unwrap() else {
+            panic!("OCI backend returned a staging file");
+        };
+        assert_eq!(bytes, Bytes::from_static(b"data"));
     }
 
     #[tokio::test]

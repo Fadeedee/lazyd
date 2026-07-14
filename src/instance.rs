@@ -13,7 +13,7 @@ use crate::error::{Error, Result};
 use crate::fanotify::FanotifyBackend;
 use crate::range_map::{BITMAP_UNIT_BYTES, RangeMap, validate_fetch_unit_bytes};
 use crate::remote::oci::OciRemoteBackend;
-use crate::remote::{AuthConfig, BlobDescriptor, RemoteBackend, RemoteSource};
+use crate::remote::{AuthConfig, BlobDescriptor, RemoteBackend, RemoteRange, RemoteSource};
 
 pub const DEFAULT_FETCH_UNIT_BYTES: u64 = BITMAP_UNIT_BYTES;
 
@@ -247,15 +247,22 @@ impl Instance {
         if self.range_map.is_range_ready(offset, len) {
             return Ok(());
         }
-        let bytes = self.remote.read_range(range.offset, range.len).await?;
-        if bytes.len() != range.len as usize {
+        let remote_range = self.remote.read_range(range.offset, range.len).await?;
+        if remote_range.len() != range.len {
             return Err(Error::Remote(format!(
                 "remote returned {} bytes, expected {}",
-                bytes.len(),
+                remote_range.len(),
                 range.len
             )));
         }
-        self.write_all_at(&bytes, range.offset)?;
+        match remote_range {
+            RemoteRange::Bytes(bytes) => self.write_all_at(&bytes, range.offset)?,
+            RemoteRange::StagingFile { .. } => {
+                return Err(Error::Remote(
+                    "staging file ranges are not connected to the cache writer".to_string(),
+                ));
+            }
+        }
         self.range_map.set_range_ready(range.offset, range.len)?;
         Ok(())
     }
@@ -373,13 +380,16 @@ mod tests {
 
     #[async_trait]
     impl RemoteBackend for MockRemote {
-        async fn read_range(&self, offset: u64, len: u64) -> Result<Bytes> {
+        async fn read_range(&self, offset: u64, len: u64) -> Result<RemoteRange> {
             self.reads.fetch_add(1, Ordering::SeqCst);
             self.calls.lock().unwrap().push((offset, len));
             if !self.delay.is_zero() {
                 tokio::time::sleep(self.delay).await;
             }
-            Ok(Bytes::from(vec![offset as u8; len as usize]))
+            Ok(RemoteRange::Bytes(Bytes::from(vec![
+                offset as u8;
+                len as usize
+            ])))
         }
     }
 
