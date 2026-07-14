@@ -59,8 +59,14 @@ registered through the control plane, usually by `prepare-image`.
 The packet carries the sparse EROFS cache file descriptor through
 `SCM_RIGHTS`. MVP successful FETCH responses always include this fd.
 
-`off`, `len`, and `dev_off` are page aligned. `dev_off` is the offset
-StratoVirt should use when mapping the returned fd into its lazy pmem HVA.
+The VMM-facing response stays page aligned for every source. Internally, OCI
+instances amplify misses to configured fixed fetch units. Kuasar instances
+instead fetch all missing canonical data extents intersecting the requested
+page; final visible hole and zero runs are already represented by sparse-cache
+zeroes and do not call accelerator `read_range`.
+
+`off`, `len`, and `dev_off` are page aligned. `dev_off` is the offset a VMM
+uses when mapping the returned fd into its lazy pmem HVA.
 
 ## Error
 
@@ -77,9 +83,10 @@ StratoVirt should use when mapping the returned fd into its lazy pmem HVA.
 ## Blob tail page
 
 FETCH may cover the final page that crosses `blob_size`. lazyd only fetches
-real bytes from the OCI blob and leaves `[blob_size, page_end)` as zeroes in
-the sparse cache. Ranges fully beyond `round_up(blob_size, page_size)` are
-padding and must be handled by StratoVirt, not lazyd.
+real bytes from the configured OCI or Kuasar source and leaves
+`[blob_size, page_end)` as zeroes in the sparse cache. Ranges fully beyond
+`round_up(blob_size, page_size)` are padding and must be handled by the VMM,
+not lazyd.
 
 ## Future extension
 

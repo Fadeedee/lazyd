@@ -36,8 +36,13 @@ Content-Type: application/json
 }
 ```
 
-`fetch.unit_bytes` defaults to 1 MiB and must be a multiple of 1 MiB. The
-bitmap stores readiness in 1 MiB slots; fetch units can span multiple slots.
+For the OCI source shown above, `fetch.unit_bytes` defaults to 1 MiB and must
+be a multiple of 1 MiB. The bitmap stores readiness in 1 MiB slots; fetch
+units can span multiple slots. Kuasar Manifest instances are registered by
+`POST /api/v1/images/prepare`, which obtains a sealed canonical extent layout
+from accelerator; callers must not construct those instances with direct PUT.
+Their `.bitmap` sidecar stores the extent table and one ready byte per final
+visible data extent instead of fixed 1 MiB slots.
 
 ## Ensure a range
 
@@ -66,9 +71,11 @@ this API. It must not ask lazyd to fetch the aligned padding after the real
 EROFS blob:
 
 ```text
-offset < blob_size                 -> ranges/ensure, pread, UFFDIO_COPY
-blob_size <= offset < pmem_size    -> UFFDIO_ZEROPAGE
+offset < blob_size                 -> FETCH and map lazyd cache FD
+blob_size <= offset < pmem_size    -> VMM zero-page handling
 ```
 
-`pmem_size` and its alignment belong to the VMM/Conch layer. lazyd only owns
-the real image range `[0, blob_size)`.
+`pmem_size` and its alignment belong to the VMM integration layer. lazyd only
+owns the real image range `[0, blob_size)`. The HTTP ensure endpoint remains
+available, but the virtio-pmem data path should use the FETCH data socket so
+the VMM receives the cache FD through `SCM_RIGHTS`.
